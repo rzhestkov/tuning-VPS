@@ -9,8 +9,8 @@ set -e  # Остановка при ошибке
 # --- Настройки (можно изменить) ---
 NEW_USER="user1"
 SSH_PORT="2332"
-GITHUB_USER="YOUR_GITHUB_USERNAME"  # ЗАМЕНИТЕ!
-REPO_NAME="vps-setup"               # ЗАМЕНИТЕ!
+GITHUB_USER="rzhestkov"
+REPO_NAME="tuning-VPS"
 SSH_KEY_URL="https://raw.githubusercontent.com/${GITHUB_USER}/${REPO_NAME}/main/ssh/authorized_keys"
 
 # Цвета для вывода

@@ -16,6 +16,10 @@ curl -fsSL https://raw.githubusercontent.com/USERNAME/REPO/main/setup_ubuntu_24.
 sudo bash setup.sh
 ```
 
+## 📁 Обновление проекта в репозиториях
+git push origin main   # в Gitea
+git push github main   # в GitHub
+
 ## 📁 Структура проекта
 
 ```
