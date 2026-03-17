@@ -94,6 +94,10 @@ else
     useradd -m -s /bin/bash "$NEW_USER"
     usermod -aG sudo "$NEW_USER"
     
+    # Настраиваем sudo без пароля (т.к. вход только по SSH-ключу)
+    echo "$NEW_USER ALL=(ALL:ALL) NOPASSWD: ALL" > /etc/sudoers.d/99-$NEW_USER
+    chmod 440 /etc/sudoers.d/99-$NEW_USER
+    
     # Блокируем пароль для пользователя (вход только по SSH-ключу)
     passwd -l "$NEW_USER" 2>/dev/null || true
     
@@ -239,62 +243,7 @@ else
 fi
 
 # ==============================================================================
-# 7. DOCKER (ОПЦИОНАЛЬНО)
-# ==============================================================================
-
-echo ""
-read -p "Установить Docker? (y/N): " install_docker
-
-if [ "$install_docker" = "y" ] || [ "$install_docker" = "Y" ]; then
-    log "Установка Docker..."
-
-    # Удаляем старые версии
-    apt-get remove -y docker docker-engine docker.io containerd runc 2>/dev/null || true
-
-    # Установка зависимостей
-    apt-get install -y -qq ca-certificates curl gnupg
-
-    # Добавление репозитория Docker
-    install -m 0755 -d /etc/apt/keyrings
-    curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
-    chmod a+r /etc/apt/keyrings/docker.asc
-
-    echo \
-      "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu \
-      $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | \
-      tee /etc/apt/sources.list.d/docker.list > /dev/null
-
-    apt-get update -qq
-    apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
-
-    # Добавляем пользователя в группу docker
-    usermod -aG docker "$NEW_USER"
-
-    # Запускаем Docker (с обработкой ошибок)
-    log "Запуск Docker сервиса..."
-    if systemctl enable docker 2>/dev/null && systemctl start docker 2>/dev/null; then
-        sleep 2
-        if docker --version > /dev/null 2>&1; then
-            log "Docker установлен: $(docker --version)"
-            add_check 0 "Установка Docker"
-        else
-            warn "Docker установлен, но не запущен. Попробуйте перезагрузить сервер."
-            add_check 1 "Docker (требуется перезагрузка)"
-        fi
-    else
-        warn "Не удалось запустить Docker сервис. Возможные причины:"
-        warn "  - Конфликт с systemd (если контейнер)"
-        warn "  - Нужна перезагрузка сервера"
-        warn "  - Проверьте: sudo systemctl status docker"
-        add_check 1 "Docker (ошибка запуска)"
-    fi
-else
-    log "Пропускаем установку Docker"
-    add_check 0 "Docker (пропущено)"
-fi
-
-# ==============================================================================
-# 8. АВТООБНОВЛЕНИЯ
+# 7. АВТООБНОВЛЕНИЯ
 # ==============================================================================
 
 log "Настройка автоматических обновлений безопасности..."
@@ -432,3 +381,54 @@ echo "  3. Проверьте UFW: sudo ufw status verbose"
 echo "  4. Логи SSH: sudo journalctl -u ssh -n 50"
 echo ""
 log "Настройка завершена!"
+
+# ==============================================================================
+# УСТАНОВКА DOCKER (ОПЦИОНАЛЬНО)
+# ==============================================================================
+
+echo ""
+read -p "Установить Docker? (y/N): " install_docker
+
+if [ "$install_docker" = "y" ] || [ "$install_docker" = "Y" ]; then
+    log "Установка Docker..."
+
+    # Удаляем старые версии
+    apt-get remove -y docker docker-engine docker.io containerd runc 2>/dev/null || true
+
+    # Установка зависимостей
+    apt-get install -y -qq ca-certificates curl gnupg
+
+    # Добавление репозитория Docker
+    install -m 0755 -d /etc/apt/keyrings
+    curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+    chmod a+r /etc/apt/keyrings/docker.asc
+
+    echo \
+      "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu \
+      $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | \
+      tee /etc/apt/sources.list.d/docker.list > /dev/null
+
+    apt-get update -qq
+    apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+
+    # Добавляем пользователя в группу docker
+    usermod -aG docker "$NEW_USER"
+
+    # Запускаем Docker (с обработкой ошибок)
+    log "Запуск Docker сервиса..."
+    if systemctl enable docker 2>/dev/null && systemctl start docker 2>/dev/null; then
+        sleep 2
+        if docker --version > /dev/null 2>&1; then
+            log "Docker установлен: $(docker --version)"
+        else
+            warn "Docker установлен, но не запущен. Попробуйте перезагрузить сервер."
+        fi
+    else
+        warn "Не удалось запустить Docker сервис. Возможные причины:"
+        warn "  - Конфликт с systemd (если контейнер)"
+        warn "  - Нужна перезагрузка сервера"
+        warn "  - Проверьте: sudo systemctl status docker"
+    fi
+else
+    log "Установка Docker пропущена"
+fi
