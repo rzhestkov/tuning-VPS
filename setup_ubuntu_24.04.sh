@@ -239,43 +239,58 @@ else
 fi
 
 # ==============================================================================
-# 7. DOCKER
+# 7. DOCKER (ОПЦИОНАЛЬНО)
 # ==============================================================================
 
-log "Установка Docker..."
+echo ""
+read -p "Установить Docker? (y/N): " install_docker
 
-# Удаляем старые версии
-apt-get remove -y docker docker-engine docker.io containerd runc 2>/dev/null || true
+if [ "$install_docker" = "y" ] || [ "$install_docker" = "Y" ]; then
+    log "Установка Docker..."
 
-# Установка зависимостей
-apt-get install -y -qq ca-certificates curl gnupg
+    # Удаляем старые версии
+    apt-get remove -y docker docker-engine docker.io containerd runc 2>/dev/null || true
 
-# Добавление репозитория Docker
-install -m 0755 -d /etc/apt/keyrings
-curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
-chmod a+r /etc/apt/keyrings/docker.asc
+    # Установка зависимостей
+    apt-get install -y -qq ca-certificates curl gnupg
 
-echo \
-  "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu \
-  $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | \
-  tee /etc/apt/sources.list.d/docker.list > /dev/null
+    # Добавление репозитория Docker
+    install -m 0755 -d /etc/apt/keyrings
+    curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+    chmod a+r /etc/apt/keyrings/docker.asc
 
-apt-get update -qq
-apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+    echo \
+      "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu \
+      $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | \
+      tee /etc/apt/sources.list.d/docker.list > /dev/null
 
-# Добавляем пользователя в группу docker
-usermod -aG docker "$NEW_USER"
+    apt-get update -qq
+    apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
 
-# Запускаем Docker
-systemctl enable docker
-systemctl start docker
+    # Добавляем пользователя в группу docker
+    usermod -aG docker "$NEW_USER"
 
-if docker --version > /dev/null 2>&1; then
-    log "Docker установлен: $(docker --version)"
-    add_check 0 "Установка Docker"
+    # Запускаем Docker (с обработкой ошибок)
+    log "Запуск Docker сервиса..."
+    if systemctl enable docker 2>/dev/null && systemctl start docker 2>/dev/null; then
+        sleep 2
+        if docker --version > /dev/null 2>&1; then
+            log "Docker установлен: $(docker --version)"
+            add_check 0 "Установка Docker"
+        else
+            warn "Docker установлен, но не запущен. Попробуйте перезагрузить сервер."
+            add_check 1 "Docker (требуется перезагрузка)"
+        fi
+    else
+        warn "Не удалось запустить Docker сервис. Возможные причины:"
+        warn "  - Конфликт с systemd (если контейнер)"
+        warn "  - Нужна перезагрузка сервера"
+        warn "  - Проверьте: sudo systemctl status docker"
+        add_check 1 "Docker (ошибка запуска)"
+    fi
 else
-    error "Docker не установлен"
-    add_check 1 "Установка Docker"
+    log "Пропускаем установку Docker"
+    add_check 0 "Docker (пропущено)"
 fi
 
 # ==============================================================================
