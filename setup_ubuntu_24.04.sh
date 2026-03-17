@@ -94,15 +94,16 @@ else
     useradd -m -s /bin/bash "$NEW_USER"
     usermod -aG sudo "$NEW_USER"
     
-    # Настраиваем sudo без пароля (т.к. вход только по SSH-ключу)
-    echo "$NEW_USER ALL=(ALL:ALL) NOPASSWD: ALL" > /etc/sudoers.d/99-$NEW_USER
-    chmod 440 /etc/sudoers.d/99-$NEW_USER
-    
     # Блокируем пароль для пользователя (вход только по SSH-ключу)
     passwd -l "$NEW_USER" 2>/dev/null || true
     
     log "Пользователь $NEW_USER создан. Вход только по SSH-ключу."
 fi
+
+# Настраиваем sudo без пароля (т.к. вход только по SSH-ключу) - всегда
+log "Настройка sudo без пароля..."
+echo "$NEW_USER ALL=(ALL:ALL) NOPASSWD: ALL" > /etc/sudoers.d/99-$NEW_USER
+chmod 440 /etc/sudoers.d/99-$NEW_USER
 
 add_check $(id "$NEW_USER" &>/dev/null; echo $?) "Создание пользователя $NEW_USER"
 
