@@ -35,6 +35,18 @@ error() {
     echo -e "${RED}[ОШИБКА]${NC} $1"
 }
 
+# Функция проверки существования UFW правила
+ufw_rule_exists() {
+    local port=$1
+    ufw status | grep -q "$port"
+    return $?
+}
+
+# Функция проверки закрыт ли порт 22
+is_port_22_closed() {
+    ! ufw status | grep -q "22/tcp"
+}
+
 # Функция добавления результата проверки
 add_check() {
     local status=$1
@@ -79,6 +91,13 @@ log "Обновление пакетов..."
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get upgrade -y -qq
+
+# Установка mc если не установлен
+if ! command -v mc &>/dev/null; then
+    log "Установка mc..."
+    apt-get install -y -qq mc
+fi
+
 add_check $? "Обновление системы"
 
 # ==============================================================================
@@ -215,11 +234,17 @@ ufw default allow outgoing
 ufw delete allow 22/tcp 2>/dev/null || true
 
 # Разрешаем новый SSH порт ПЕРЕД включением файрвола!
-ufw allow "$SSH_PORT/tcp" comment 'SSH Custom Port'
+if ! ufw_rule_exists "$SSH_PORT/tcp"; then
+    ufw allow "$SSH_PORT/tcp" comment 'SSH Custom Port'
+fi
 
 # Разрешаем веб-порты
-ufw allow 80/tcp comment 'HTTP'
-ufw allow 443/tcp comment 'HTTPS'
+if ! ufw_rule_exists "80/tcp"; then
+    ufw allow 80/tcp comment 'HTTP'
+fi
+if ! ufw_rule_exists "443/tcp"; then
+    ufw allow 443/tcp comment 'HTTPS'
+fi
 
 # ВАЖНО: Если UFW был включен ранее, сохраняем его состояние для восстановления доступа
 # Порт 22 будет удалён позже после проверки подключения
@@ -276,24 +301,29 @@ add_check $? "Автоматические обновления"
 # 9. ЗАКРЫТИЕ СТАРОГО SSH ПОРТА (ФИНАЛЬНЫЙ ЭТАП)
 # ==============================================================================
 
-warn "=========================================="
-warn "ВНИМАНИЕ! Сейчас будет закрыт порт 22."
-warn "=========================================="
-warn "Перед продолжением:"
-warn "1. Откройте НОВОЕ окно терминала"
-warn "2. Подключитесь: ssh -p $SSH_PORT $NEW_USER@$(hostname -I | awk '{print $1}')"
-warn "3. Убедитесь, что подключение работает!"
-warn ""
-read -p "Подключение работает? Закрыть порт 22? (yes/no): " confirm
-
-if [ "$confirm" = "yes" ]; then
-    ufw delete allow 22/tcp 2>/dev/null || true
-    log "Порт 22 закрыт"
-    add_check 0 "Закрытие порта 22"
+if is_port_22_closed; then
+    log "Порт 22 уже закрыт, пропускаем"
+    add_check 0 "Закрытие порта 22 (уже закрыт)"
 else
-    warn "Порт 22 оставлен открытым! Закройте его вручную позже:"
-    warn "sudo ufw delete allow 22/tcp"
-    add_check 1 "Закрытие порта 22 (отложено)"
+    warn "=========================================="
+    warn "ВНИМАНИЕ! Сейчас будет закрыт порт 22."
+    warn "=========================================="
+    warn "Перед продолжением:"
+    warn "1. Откройте НОВОЕ окно терминала"
+    warn "2. Подключитесь: ssh -p $SSH_PORT $NEW_USER@$(hostname -I | awk '{print $1}')"
+    warn "3. Убедитесь, что подключение работает!"
+    warn ""
+    read -p "Подключение работает? Закрыть порт 22? (yes/no): " confirm
+
+    if [ "$confirm" = "yes" ]; then
+        ufw delete allow 22/tcp 2>/dev/null || true
+        log "Порт 22 закрыт"
+        add_check 0 "Закрытие порта 22"
+    else
+        warn "Порт 22 оставлен открытым! Закройте его вручную позже:"
+        warn "sudo ufw delete allow 22/tcp"
+        add_check 1 "Закрытие порта 22 (отложено)"
+    fi
 fi
 
 # ==============================================================================
@@ -384,52 +414,145 @@ echo ""
 log "Настройка завершена!"
 
 # ==============================================================================
-# УСТАНОВКА DOCKER (ОПЦИОНАЛЬНО)
+# ПРОВЕРКА ПРЕДУСТАНОВЛЕННЫХ ПАКЕТОВ
 # ==============================================================================
 
 echo ""
-read -p "Установить Docker? (y/N): " install_docker
+echo "╔════════════════════════════════════════════════════════════╗"
+echo "║         ПРОВЕРКА ПРЕДУСТАНОВЛЕННЫХ ПАКЕТОВ                ║"
+echo "╚════════════════════════════════════════════════════════════╝"
+echo ""
 
-if [ "$install_docker" = "y" ] || [ "$install_docker" = "Y" ]; then
-    log "Установка Docker..."
+# Функция проверки пакета
+check_pkg() {
+    local pkg=$1
+    local name=${2:-$1}
+    if command -v "$pkg" &>/dev/null; then
+        local version=$($pkg --version 2>/dev/null | head -1 | awk '{print $NF}' || echo "установлен")
+        printf "  ${GREEN}✓${NC} %-15s %s\n" "$name" "$version"
+        return 0
+    else
+        printf "  ${RED}✗${NC} %-15s %s\n" "$name" "-"
+        return 1
+    fi
+}
 
-    # Удаляем старые версии
-    apt-get remove -y docker docker-engine docker.io containerd runc 2>/dev/null || true
+# Функция проверки сервиса
+check_service() {
+    local svc=$1
+    local name=${2:-$1}
+    if systemctl is-active "$svc" &>/dev/null; then
+        printf "  ${GREEN}✓${NC} %-15s %s\n" "$name" "(active)"
+        return 0
+    elif dpkg -l | grep -q "^ii  $svc"; then
+        printf "  ${YELLOW}○${NC} %-15s %s\n" "$name" "(installed, stopped)"
+        return 0
+    else
+        printf "  ${RED}✗${NC} %-15s %s\n" "$name" "-"
+        return 1
+    fi
+}
 
-    # Установка зависимостей
-    apt-get install -y -qq ca-certificates curl gnupg
+echo "Python & Dev:"
+    check_pkg "python3"
+    check_pkg "pip3"
+echo ""
 
-    # Добавление репозитория Docker
-    install -m 0755 -d /etc/apt/keyrings
-    curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
-    chmod a+r /etc/apt/keyrings/docker.asc
+echo "Docker:"
+    DOCKER_INSTALLED=false
+    if check_pkg "docker"; then
+        DOCKER_INSTALLED=true
+    fi
+    check_pkg "docker-compose"
+echo ""
 
-    echo \
-      "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu \
-      $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | \
-      tee /etc/apt/sources.list.d/docker.list > /dev/null
+echo "Веб-серверы:"
+    check_service "nginx" "nginx"
+    check_service "apache2" "apache"
+echo ""
 
-    apt-get update -qq
-    apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+echo "Базы данных:"
+    check_service "mysql" "mysql"
+    check_service "postgresql" "postgresql"
+    check_service "redis-server" "redis"
+echo ""
 
-    # Добавляем пользователя в группу docker
-    usermod -aG docker "$NEW_USER"
+echo "Инструменты:"
+    check_pkg "git"
+    check_pkg "curl"
+    check_pkg "wget"
+    check_pkg "node" "nodejs"
+    check_pkg "npm"
+    check_pkg "nano"
+    check_pkg "vim"
+    check_pkg "htop"
+echo ""
 
-    # Запускаем Docker (с обработкой ошибок)
-    log "Запуск Docker сервиса..."
-    if systemctl enable docker 2>/dev/null && systemctl start docker 2>/dev/null; then
-        sleep 2
-        if docker --version > /dev/null 2>&1; then
-            log "Docker установлен: $(docker --version)"
+echo "Безопасность:"
+    check_service "ufw" "ufw"
+    check_service "fail2ban" "fail2ban"
+    check_pkg "certbot"
+echo ""
+
+echo "Система:"
+echo "  Диск:"
+df -h / | tail -1 | awk '{printf "    Всего: %s, Свободно: %s (%.0f%%)\n", $2, $4, $5}'
+echo ""
+echo "  Память:"
+free -h | grep "Mem:" | awk '{printf "    Всего: %s, Свободно: %s, Использовано: %s\n", $2, $4, $3}'
+echo ""
+
+# ==============================================================================
+# УСТАНОВКА DOCKER (ОПЦИОНАЛЬНО)
+# ==============================================================================
+
+if [ "$DOCKER_INSTALLED" = false ]; then
+    echo ""
+    read -p "Установить Docker? (y/N): " install_docker
+
+    if [ "$install_docker" = "y" ] || [ "$install_docker" = "Y" ]; then
+        log "Установка Docker..."
+
+        # Удаляем старые версии
+        apt-get remove -y docker docker-engine docker.io containerd runc 2>/dev/null || true
+
+        # Установка зависимостей
+        apt-get install -y -qq ca-certificates curl gnupg
+
+        # Добавление репозитория Docker
+        install -m 0755 -d /etc/apt/keyrings
+        curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+        chmod a+r /etc/apt/keyrings/docker.asc
+
+        echo \
+          "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu \
+          $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | \
+          tee /etc/apt/sources.list.d/docker.list > /dev/null
+
+        apt-get update -qq
+        apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+
+        # Добавляем пользователя в группу docker
+        usermod -aG docker "$NEW_USER"
+
+        # Запускаем Docker (с обработкой ошибок)
+        log "Запуск Docker сервиса..."
+        if systemctl enable docker 2>/dev/null && systemctl start docker 2>/dev/null; then
+            sleep 2
+            if docker --version > /dev/null 2>&1; then
+                log "Docker установлен: $(docker --version)"
+            else
+                warn "Docker установлен, но не запущен. Попробуйте перезагрузить сервер."
+            fi
         else
-            warn "Docker установлен, но не запущен. Попробуйте перезагрузить сервер."
+            warn "Не удалось запустить Docker сервис. Возможные причины:"
+            warn "  - Конфликт с systemd (если контейнер)"
+            warn "  - Нужна перезагрузка сервера"
+            warn "  - Проверьте: sudo systemctl status docker"
         fi
     else
-        warn "Не удалось запустить Docker сервис. Возможные причины:"
-        warn "  - Конфликт с systemd (если контейнер)"
-        warn "  - Нужна перезагрузка сервера"
-        warn "  - Проверьте: sudo systemctl status docker"
+        log "Установка Docker пропущена"
     fi
 else
-    log "Установка Docker пропущена"
+    log "Docker уже установлен, пропускаем установку"
 fi
