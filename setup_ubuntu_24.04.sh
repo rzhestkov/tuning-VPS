@@ -414,16 +414,10 @@ echo ""
 log "Настройка завершена!"
 
 # ==============================================================================
-# ПРОВЕРКА ПРЕДУСТАНОВЛЕННЫХ ПАКЕТОВ
+# ФУНКЦИИ ПРОВЕРКИ ПАКЕТОВ
 # ==============================================================================
 
-echo ""
-echo "╔════════════════════════════════════════════════════════════╗"
-echo "║         ПРОВЕРКА ПРЕДУСТАНОВЛЕННЫХ ПАКЕТОВ                ║"
-echo "╚════════════════════════════════════════════════════════════╝"
-echo ""
-
-# Функция проверки пакета
+# Функция проверки пакета (всегда возвращает 0 для set -e)
 check_pkg() {
     local pkg=$1
     local name=${2:-$1}
@@ -433,65 +427,79 @@ check_pkg() {
         return 0
     else
         printf "  ${RED}✗${NC} %-15s %s\n" "$name" "-"
-        return 1
+        return 0
     fi
 }
 
-# Функция проверки сервиса
+# Функция проверки наличия пакета (для условий, возвращает 0/1)
+is_pkg_installed() {
+    command -v "$1" &>/dev/null
+}
+
+# Функция проверки сервиса (всегда возвращает 0 для set -e)
 check_service() {
     local svc=$1
     local name=${2:-$1}
     if systemctl is-active "$svc" &>/dev/null; then
         printf "  ${GREEN}✓${NC} %-15s %s\n" "$name" "(active)"
-        return 0
     elif dpkg -l | grep -q "^ii  $svc"; then
         printf "  ${YELLOW}○${NC} %-15s %s\n" "$name" "(installed, stopped)"
-        return 0
     else
         printf "  ${RED}✗${NC} %-15s %s\n" "$name" "-"
-        return 1
     fi
+    return 0
 }
 
+# Проверка Docker отдельно
+echo ""
+echo "╔════════════════════════════════════════════════════════════╗"
+echo "║         ПРОВЕРКА ПРЕДУСТАНОВЛЕННЫХ ПАКЕТОВ                ║"
+echo "╚════════════════════════════════════════════════════════════╝"
+echo ""
+
 echo "Python & Dev:"
-    check_pkg "python3"
-    check_pkg "pip3"
+check_pkg "python3"
+check_pkg "pip3"
 echo ""
 
 echo "Docker:"
     DOCKER_INSTALLED=false
-    if check_pkg "docker"; then
+    if is_pkg_installed "docker"; then
+        check_pkg "docker"
         DOCKER_INSTALLED=true
+    else
+        check_pkg "docker"
     fi
     check_pkg "docker-compose"
 echo ""
 
 echo "Веб-серверы:"
-    check_service "nginx" "nginx"
-    check_service "apache2" "apache"
+check_service "nginx" "nginx"
+check_service "apache2" "apache"
 echo ""
 
 echo "Базы данных:"
-    check_service "mysql" "mysql"
-    check_service "postgresql" "postgresql"
-    check_service "redis-server" "redis"
+check_service "mysql" "mysql"
+check_service "postgresql" "postgresql"
+check_service "redis-server" "redis"
 echo ""
 
 echo "Инструменты:"
-    check_pkg "git"
-    check_pkg "curl"
-    check_pkg "wget"
-    check_pkg "node" "nodejs"
-    check_pkg "npm"
-    check_pkg "nano"
-    check_pkg "vim"
-    check_pkg "htop"
+check_pkg "git"
+check_pkg "curl"
+check_pkg "wget"
+check_pkg "node" "nodejs"
+check_pkg "npm"
+check_pkg "nano"
+check_pkg "vim"
+check_pkg "htop"
+check_pkg "mc"
 echo ""
 
 echo "Безопасность:"
-    check_service "ufw" "ufw"
-    check_service "fail2ban" "fail2ban"
-    check_pkg "certbot"
+check_service "ufw" "ufw"
+check_service "fail2ban" "fail2ban"
+check_pkg "certbot"
 echo ""
 
 echo "Система:"
