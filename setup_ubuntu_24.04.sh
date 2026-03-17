@@ -159,6 +159,9 @@ ClientAliveCountMax 2
 EOF
 
 # 5.3 Проверка конфигурации
+# Создаем необходимую директорию для проверки конфига
+mkdir -p /run/sshd
+
 if ! sshd -t; then
     error "Ошибка в конфигурации SSH! Восстанавливаю бэкап..."
     if [ -f "$SSHD_BACKUP_FILE" ]; then

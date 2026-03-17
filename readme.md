@@ -10,7 +10,7 @@
 ssh root@YOUR_SERVER_IP
 
 # 2. Скачайте скрипт (замените USERNAME и REPO)
-curl -fsSL https://raw.githubusercontent.com/USERNAME/REPO/main/setup_ubuntu_24.04.sh -o setup.sh
+curl -fsSL https://raw.githubusercontent.com/rzhestkov/tuning-VPS/main/setup_ubuntu_24.04.sh -o setup.sh
 
 # 3. Запустите
 sudo bash setup.sh
