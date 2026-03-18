@@ -229,10 +229,8 @@ apt-get install -y -qq logrotate 2>/dev/null || true
 # Создание кастомного конфига для системных логов
 cat > /etc/logrotate.d/custom-system << 'EOF'
 # Кастомная настройка ротации системных логов
-/var/log/syslog
 /var/log/auth.log
-/var/log/kern.log
-/var/log/messages {
+/var/log/kern.log {
     daily
     missingok
     rotate 7
@@ -242,7 +240,7 @@ cat > /etc/logrotate.d/custom-system << 'EOF'
     create 0640 root adm
     sharedscripts
     postrotate
-        systemctl kill -s HUP systemd-journald 2>/dev/null || true
+        systemctl kill -s HUP rsyslog 2>/dev/null || true
     endscript
 }
 
@@ -263,7 +261,7 @@ cat > /etc/logrotate.d/custom-system << 'EOF'
 EOF
 
 # Проверка конфигурации logrotate
-if logrotate -d /etc/logrotate.d/custom-system 2>/dev/null | grep -q "error"; then
+if logrotate -d /etc/logrotate.d/custom-system 2>&1 | grep -qi "error"; then
     warn "Ошибка в конфигурации logrotate"
     add_check 1 "Настройка logrotate"
 else
@@ -306,7 +304,7 @@ fs.protected_hardlinks = 1
 fs.protected_symlinks = 1
 
 # Ограничение использования памяти для root
-vm.overcommit_memory = 1
+vm.overcommit_memory = 0
 
 # Защита от оверфлоуров
 kernel.randomize_va_space = 2
@@ -346,12 +344,12 @@ cat >> /etc/security/limits.conf << EOF
 
 # Hard limits для всех пользователей
 * hard nproc 500
-* hard nofile 1024
+* hard nofile 65535
 * hard rss 500000
 
 # Hard limits для конкретного пользователя
 $NEW_USER hard nproc 100
-$NEW_USER hard nofile 1024
+$NEW_USER hard nofile 65535
 $NEW_USER hard rss 500000
 EOF
 
@@ -360,12 +358,12 @@ mkdir -p /etc/security/limits.d
 cat > /etc/security/limits.d/99-custom.conf << EOF
 # Custom limits for $NEW_USER
 $NEW_USER hard nproc 100
-$NEW_USER hard nofile 1024
+$NEW_USER hard nofile 65535
 $NEW_USER hard rss 500000
 
 # Global limits
 * hard nproc 500
-* hard nofile 1024
+* hard nofile 65535
 EOF
 
 log "Ограничения для пользователей настроены"
