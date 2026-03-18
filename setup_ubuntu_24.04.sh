@@ -669,3 +669,136 @@ if [ "$DOCKER_INSTALLED" = false ]; then
 else
     log "Docker уже установлен, пропускаем установку"
 fi
+# ==============================================================================
+# УСТАНОВКА MTPROTO PROXY (ОПЦИОНАЛЬНО)
+# ==============================================================================
+# Проверяем, доступен ли Docker (установлен ли он только что или ранее)
+DOCKER_AVAILABLE=false
+if command -v docker &>/dev/null && docker info &>/dev/null; then
+    DOCKER_AVAILABLE=true
+elif command -v docker &>/dev/null; then
+    # Docker установлен, но возможно не запущен - пробуем запустить
+    systemctl start docker 2>/dev/null || true
+    sleep 2
+    docker info &>/dev/null && DOCKER_AVAILABLE=true
+fi
+if [ "$DOCKER_AVAILABLE" = true ]; then
+    echo ""
+    read -p "Установить MTProto Proxy для Telegram? (y/N): " install_mtproto
+    
+    if [ "$install_mtproto" = "y" ] || [ "$install_mtproto" = "Y" ]; then
+        log "Настройка MTProto Proxy..."
+        
+        # Запрашиваем домен для маскировки
+        read -p "Введите домен для маскировки трафика [по умолчанию: meets.guestme.ru]: " domain
+        domain=${domain:-meets.guestme.ru}
+        
+        log "Генерация секретного ключа (домен: $domain)..."
+        SECRET=$(docker run --rm nineseconds/mtg:2 generate-secret --hex "$domain" 2>/dev/null | tr -d '\r\n')
+        
+        if [ -z "$SECRET" ]; then
+            error "Не удалось сгенерировать секрет. Пробуем еще раз..."
+            SECRET=$(docker run --rm nineseconds/mtg:2 generate-secret --hex "$domain" 2>/dev/null | tr -d '\r\n')
+        fi
+        
+        if [ -n "$SECRET" ]; then
+            log "Секрет сгенерирован: $SECRET"
+            
+            # Останавливаем и удаляем старый контейнер если есть
+            docker stop mtproto-proxy &>/dev/null || true
+            docker rm mtproto-proxy &>/dev/null || true
+            
+            # Запускаем контейнер
+            log "Запуск MTProto Proxy на порту 443..."
+            docker run -d \
+              --name mtproto-proxy \
+              --restart unless-stopped \
+              -p 443:443 \
+              nineseconds/mtg:2 \
+              simple-run -n 1.1.1.1 -i prefer-ipv4 0.0.0.0:443 "$SECRET"
+            
+            sleep 3
+            
+            # Проверяем, что контейнер запущен
+            if docker ps | grep -q mtproto-proxy; then
+                log "MTProto Proxy успешно запущен!"
+                
+                # Получаем IP сервера
+                SERVER_IP=$(curl -s ifconfig.me || hostname -I | awk '{print $1}')
+                
+                echo ""
+                echo "╔════════════════════════════════════════════════════════════╗"
+                echo "║              MTPROTO PROXY НАСТРОЕН                        ║"
+                echo "╚════════════════════════════════════════════════════════════╝"
+                echo ""
+                echo "  Сервер: $SERVER_IP"
+                echo "  Порт: 443"
+                echo "  Секрет: $SECRET"
+                echo "  Домен маскировки: $domain"
+                echo ""
+                echo "  Ссылка для подключения:"
+                echo "  tg://proxy?server=$SERVER_IP&port=443&secret=$SECRET"
+                echo ""
+                echo "  Ссылка (для копирования):"
+                echo -e "${YELLOW}tg://proxy?server=$SERVER_IP&port=443&secret=$SECRET${NC}"
+                echo ""
+                echo "  Для генерации QR-кода установите qrencode:"
+                echo "  sudo apt install qrencode"
+                echo "  qrencode -t ANSIUTF8 'tg://proxy?server=$SERVER_IP&port=443&secret=$SECRET'"
+                echo ""
+                echo "  Проверка логов: docker logs -f mtproto-proxy"
+                echo "  Остановка: docker stop mtproto-proxy"
+                echo "  Удаление: docker rm -f mtproto-proxy"
+                echo ""
+                
+                # Добавляем в массив проверок
+                CHECKS+=("${GREEN}[OK]${NC} MTProto Proxy (порт 443)")
+            else
+                error "Контейнер MTProto не запустился. Проверьте логи: docker logs mtproto-proxy"
+                CHECKS+=("${RED}[FAIL]${NC} MTProto Proxy (ошибка запуска)")
+            fi
+        else
+            error "Не удалось сгенерировать секретный ключ"
+            CHECKS+=("${RED}[FAIL]${NC} MTProto Proxy (ошибка генерации секрета)")
+        fi
+    else
+        log "Установка MTProto Proxy пропущена"
+    fi
+else
+    warn "Docker недоступен, пропускаем установку MTProto Proxy"
+fi
+# ==============================================================================
+# ФИНАЛЬНЫЙ ОТЧЕТ С MTPROTO
+# ==============================================================================
+echo ""
+echo "╔════════════════════════════════════════════════════════════╗"
+echo "║              ФИНАЛЬНЫЙ ОТЧЕТ О НАСТРОЙКЕ                   ║"
+echo "╚════════════════════════════════════════════════════════════╝"
+echo ""
+# Выводим все проверки еще раз для наглядности
+echo "Итоговый статус:"
+echo "----------------"
+for check in "${CHECKS[@]}"; do
+    echo -e "  $check"
+done
+# Информация о MTProto в финальном отчете
+if docker ps | grep -q mtproto-proxy 2>/dev/null; then
+    MTPROTO_SECRET=$(docker logs mtproto-proxy 2>&1 | grep -oP '[a-f0-9]{64}' | head -1 || echo "$SECRET")
+    SERVER_IP=$(curl -s ifconfig.me || hostname -I | awk '{print $1}')
+    
+    echo ""
+    echo "MTProto Proxy активен:"
+    echo "----------------------"
+    echo -e "  Статус: ${GREEN}запущен${NC}"
+    echo "  Порт: 443"
+    echo "  IP: $SERVER_IP"
+    [ -n "$MTPROTO_SECRET" ] && echo "  Секрет: $MTPROTO_SECRET"
+    echo ""
+    echo "  Поделиться ссылкой:"
+    echo -e "  ${YELLOW}https://t.me/proxy?server=$SERVER_IP&port=443&secret=$MTPROTO_SECRET${NC}"
+fi
+echo ""
+echo "╔════════════════════════════════════════════════════════════╗"
+echo "║                     НАСТРОЙКА ЗАВЕРШЕНА                    ║"
+echo "╚════════════════════════════════════════════════════════════╝"
+echo ""
