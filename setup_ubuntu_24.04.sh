@@ -11,6 +11,9 @@ GITHUB_USER="rzhestkov"
 REPO_NAME="tuning-VPS"
 SSH_KEY_URL="https://raw.githubusercontent.com/${GITHUB_USER}/${REPO_NAME}/main/ssh/authorized_keys"
 
+# Получение IP сервера (один раз в начале скрипта)
+SERVER_IP=$(curl -s --max-time 5 ifconfig.me 2>/dev/null || hostname -I | awk '{print $1}')
+
 # Цвета для вывода
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -55,7 +58,8 @@ is_port_22_closed() {
     # Проверяем реальное состояние сокета (слушает ли какой-то сервис порт 22)
     # ss -tlnp показывает только LISTENING сокеты, не ESTABLISHED соединения
     local socket_closed=false
-    if ! ss -tlnp 2>/dev/null | grep -q ":22 "; then
+    # Более надежная проверка: ищем порт 22 в любом формате (0.0.0.0:22, *:22, 127.0.0.1:22)
+    if ! ss -tlnp 2>/dev/null | grep -qE '(:22\s|\.22\s)'; then
         socket_closed=true
     fi
     
@@ -72,6 +76,71 @@ add_check() {
     else
         CHECKS+=("${RED}[FAIL]${NC} $message")
     fi
+}
+
+# Функция проверки пакета (всегда возвращает 0 для set -e)
+# Использует специальную логику для пакетов с нестандартным выводом версии
+check_pkg() {
+    local pkg=$1
+    local name=${2:-$1}
+    if command -v "$pkg" &>/dev/null; then
+        local version=""
+        
+        # Специальная обработка для пакетов с нестандартным выводом версии
+        case "$pkg" in
+            git)
+                version=$($pkg --version 2>/dev/null | grep -oP '\d+\.\d+\.\d+' | head -1)
+                ;;
+            node)
+                version=$($pkg --version 2>/dev/null | tr -d 'v')
+                ;;
+            npm)
+                version=$($pkg --version 2>/dev/null)
+                ;;
+            pip3|pip)
+                # pip3 --version: "pip 21.2 from /path (python 3.10)" - версия первое слово
+                version=$($pkg --version 2>/dev/null | awk '{print $2}')
+                ;;
+            docker)
+                version=$($pkg --version 2>/dev/null | cut -d' ' -f3 | tr -d ',')
+                ;;
+            python3|python)
+                version=$($pkg --version 2>/dev/null | cut -d' ' -f2)
+                ;;
+            *)
+                # Универсальный метод для остальных пакетов
+                version=$($pkg --version 2>/dev/null | head -1 | awk '{print $NF}')
+                ;;
+        esac
+        
+        # Если версия пустая, используем "установлен"
+        [ -z "$version" ] && version="установлен"
+        
+        printf "  ${GREEN}✓${NC} %-15s %s\n" "$name" "$version"
+        return 0
+    else
+        printf "  ${RED}✗${NC} %-15s %s\n" "$name" "-"
+        return 0
+    fi
+}
+
+# Функция проверки наличия пакета (для условий, возвращает 0/1)
+is_pkg_installed() {
+    command -v "$1" &>/dev/null
+}
+
+# Функция проверки сервиса (всегда возвращает 0 для set -e)
+check_service() {
+    local svc=$1
+    local name=${2:-$1}
+    if systemctl is-active "$svc" &>/dev/null; then
+        printf "  ${GREEN}✓${NC} %-15s %s\n" "$name" "(active)"
+    elif dpkg -l | grep -q "^ii  $svc"; then
+        printf "  ${YELLOW}○${NC} %-15s %s\n" "$name" "(installed, stopped)"
+    else
+        printf "  ${RED}✗${NC} %-15s %s\n" "$name" "-"
+    fi
+    return 0
 }
 
 # 1. ПРОВЕРКИ ПЕРЕД СТАРТОМ ====================================================
@@ -837,12 +906,12 @@ ip -4 addr show | grep inet | awk '{print "  " $2 " on " $NF}'
 
 echo ""
 echo "===ВАЖНЫЕ ДАННЫЕ==="
-echo -e "  IP сервера:      ${GREEN}$(curl -s ifconfig.me || hostname -I | awk '{print $1}')${NC}"
+echo -e "  IP сервера:      ${GREEN}$SERVER_IP${NC}"
 echo -e "  SSH порт:        ${GREEN}$SSH_PORT${NC}"
 echo -e "  Пользователь:    ${GREEN}$NEW_USER${NC}"
 echo ""
 echo "Команда для подключения:"
-echo -e "${YELLOW}  ssh -p $SSH_PORT $NEW_USER@$(curl -s ifconfig.me || echo 'YOUR_SERVER_IP')${NC}"
+echo -e "${YELLOW}  ssh -p $SSH_PORT $NEW_USER@$SERVER_IP${NC}"
 echo ""
 echo "Если что-то не работает:"
 echo "  1. Проверьте статус SSH: sudo systemctl status ssh"
@@ -1077,38 +1146,35 @@ if [ "$DOCKER_AVAILABLE" = true ]; then
             
             sleep 3
             
-            # Проверяем, что контейнер запущен
-            if docker ps | grep -q mtproto-proxy; then
-                log "MTProto Proxy успешно запущен!"
-                
-                # Получаем IP сервера
-                SERVER_IP=$(curl -s ifconfig.me || hostname -I | awk '{print $1}')
-                
-                echo ""
-                echo "===MTPROTO PROXY НАСТРОЕН==="
-                echo ""
-                echo "  Сервер: $SERVER_IP"
-                echo "  Порт: 443"
-                echo "  Секрет: $SECRET"
-                echo "  Домен маскировки: $domain"
-                echo ""
-                echo "  Ссылка для подключения:"
-                echo "  tg://proxy?server=$SERVER_IP&port=443&secret=$SECRET"
-                echo ""
-                echo "  Ссылка (для копирования):"
-                echo -e "${YELLOW}tg://proxy?server=$SERVER_IP&port=443&secret=$SECRET${NC}"
-                echo ""
-                echo "  Проверка логов: docker logs -f mtproto-proxy"
-                echo "  Остановка: docker stop mtproto-proxy"
-                echo "  Удаление: docker rm -f mtproto-proxy"
-                echo ""
-                
-                # Добавляем в массив проверок
-                CHECKS+=("${GREEN}[OK]${NC} MTProto Proxy (порт 443)")
-            else
-                error "Контейнер MTProto не запустился. Проверьте логи: docker logs mtproto-proxy"
-                CHECKS+=("${RED}[FAIL]${NC} MTProto Proxy (ошибка запуска)")
-            fi
+# Проверяем, что контейнер запущен
+if docker ps | grep -q mtproto-proxy; then
+    log "MTProto Proxy успешно запущен!"
+    
+    echo ""
+    echo "===MTPROTO PROXY НАСТРОЕН==="
+    echo ""
+    echo "  Сервер: $SERVER_IP"
+    echo "  Порт: 443"
+    echo "  Секрет: $SECRET"
+    echo "  Домен маскировки: $domain"
+    echo ""
+    echo "  Ссылка для подключения:"
+    echo "  tg://proxy?server=$SERVER_IP&port=443&secret=$SECRET"
+    echo ""
+    echo "  Ссылка (для копирования):"
+    echo -e "${YELLOW}tg://proxy?server=$SERVER_IP&port=443&secret=$SECRET${NC}"
+    echo ""
+    echo "  Проверка логов: docker logs -f mtproto-proxy"
+    echo "  Остановка: docker stop mtproto-proxy"
+    echo "  Удаление: docker rm -f mtproto-proxy"
+    echo ""
+    
+    # Добавляем в массив проверок
+    CHECKS+=("${GREEN}[OK]${NC} MTProto Proxy (порт 443)")
+else
+    error "Контейнер MTProto не запустился. Проверьте логи: docker logs mtproto-proxy"
+    CHECKS+=("${RED}[FAIL]${NC} MTProto Proxy (ошибка запуска)")
+fi
         else
             error "Не удалось сгенерировать секретный ключ"
             CHECKS+=("${RED}[FAIL]${NC} MTProto Proxy (ошибка генерации секрета)")
@@ -1134,7 +1200,6 @@ done
 # Информация о MTProto в финальном отчете
 if docker ps | grep -q mtproto-proxy 2>/dev/null; then
     MTPROTO_SECRET=$(docker logs mtproto-proxy 2>&1 | grep -oP '[a-f0-9]{64}' | head -1 || echo "$SECRET")
-    SERVER_IP=$(curl -s ifconfig.me || hostname -I | awk '{print $1}')
     
     echo ""
     echo "MTProto Proxy активен:"
