@@ -22,6 +22,9 @@ NC='\033[0m' # No Color
 # Массив для результатов диагностики
 declare -a CHECKS
 
+# Переменная для проверки установки Docker (объявляем в начале для проблемы 8)
+DOCKER_INSTALLED=false
+
 # Функция логирования
 log() {
     echo -e "${GREEN}[$(date +%H:%M:%S)]${NC} $1"
@@ -43,8 +46,23 @@ ufw_rule_exists() {
 }
 
 # Функция проверки закрыт ли порт 22
+# Проверяет и UFW правила, и реальное состояние сокета
 is_port_22_closed() {
-    ! ufw status | grep -q "22/tcp"
+    # Проверяем UFW правило
+    local ufw_closed=false
+    if ! ufw status | grep -q "22/tcp"; then
+        ufw_closed=true
+    fi
+    
+    # Проверяем реальное состояние сокета (слушает ли какой-то сервис порт 22)
+    # ss -tlnp показывает только LISTENING сокеты, не ESTABLISHED соединения
+    local socket_closed=false
+    if ! ss -tlnp 2>/dev/null | grep -q ":22 "; then
+        socket_closed=true
+    fi
+    
+    # Порт считается закрытым, если закрыт и в UFW, и в сокете
+    $ufw_closed && $socket_closed
 }
 
 # Функция добавления результата проверки
@@ -73,7 +91,15 @@ fi
 
 # Проверка Ubuntu
 if ! grep -q "Ubuntu" /etc/os-release; then
-    warn "Это не Ubuntu. Скрипт рассчитан на Ubuntu 24.04"
+    error "Это не Ubuntu. Скрипт рассчитан на Ubuntu"
+    exit 1
+fi
+
+# Проверка версии Ubuntu 24.04
+UBUNTU_VERSION=$(grep VERSION_ID /etc/os-release | cut -d'"' -f2)
+if [ "$UBUNTU_VERSION" != "24.04" ]; then
+    warn "Внимание: скрипт протестирован на Ubuntu 24.04, у вас $UBUNTU_VERSION"
+    warn "Поведение может отличаться (sshd_config.d, cloud-init, ssh.socket)"
 fi
 
 # Проверка подключения к GitHub
@@ -91,6 +117,7 @@ log "Обновление пакетов..."
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get upgrade -y -qq
+UPDATE_RESULT=$?
 
 # Установка mc если не установлен
 if ! command -v mc &>/dev/null; then
@@ -98,7 +125,7 @@ if ! command -v mc &>/dev/null; then
     apt-get install -y -qq mc
 fi
 
-add_check $? "Обновление системы"
+add_check $UPDATE_RESULT "Обновление системы"
 
 # ==============================================================================
 # 3. СОЗДАНИЕ ПОЛЬЗОВАТЕЛЯ
@@ -106,25 +133,43 @@ add_check $? "Обновление системы"
 
 log "Создание пользователя $NEW_USER..."
 
+USER_EXISTS=false
+USER_CREATED=false
+
 if id "$NEW_USER" &>/dev/null; then
-    warn "Пользователь $NEW_USER уже существует"
+    warn "Пользователь $NEW_USER уже существует, пропускаем создание"
+    USER_EXISTS=true
 else
     # Создаем пользователя без пароля (вход только по ключу)
-    useradd -m -s /bin/bash "$NEW_USER"
-    usermod -aG sudo "$NEW_USER"
-    
-    # Блокируем пароль для пользователя (вход только по SSH-ключу)
-    passwd -l "$NEW_USER" 2>/dev/null || true
-    
-    log "Пользователь $NEW_USER создан. Вход только по SSH-ключу."
+    # Сохраняем результат useradd для проверки
+    if useradd -m -s /bin/bash "$NEW_USER"; then
+        USER_CREATED=true
+        usermod -aG sudo "$NEW_USER" || true
+        
+        # Блокируем пароль для пользователя (вход только по SSH-ключу)
+        passwd -l "$NEW_USER" 2>/dev/null || true
+        
+        log "Пользователь $NEW_USER создан. Вход только по SSH-ключу."
+    else
+        error "Не удалось создать пользователя $NEW_USER"
+        exit 1
+    fi
 fi
 
-# Настраиваем sudo без пароля (т.к. вход только по SSH-ключу) - всегда
-log "Настройка sudo без пароля..."
-echo "$NEW_USER ALL=(ALL:ALL) NOPASSWD: ALL" > /etc/sudoers.d/99-$NEW_USER
-chmod 440 /etc/sudoers.d/99-$NEW_USER
+# Настраиваем sudo без пароля только если пользователь был создан
+if [ "$USER_CREATED" = true ]; then
+    log "Настройка sudo без пароля..."
+    echo "$NEW_USER ALL=(ALL:ALL) NOPASSWD: ALL" > /etc/sudoers.d/99-$NEW_USER
+    chmod 440 /etc/sudoers.d/99-$NEW_USER
+fi
 
-add_check $(id "$NEW_USER" &>/dev/null; echo $?) "Создание пользователя $NEW_USER"
+if [ "$USER_EXISTS" = true ]; then
+    add_check 0 "Пользователь $NEW_USER (уже существует)"
+elif [ "$USER_CREATED" = true ]; then
+    add_check 0 "Создание пользователя $NEW_USER"
+else
+    add_check 1 "Создание пользователя $NEW_USER"
+fi
 
 # ==============================================================================
 # 4. НАСТРОЙКА SSH КЛЮЧЕЙ
@@ -137,6 +182,14 @@ SSH_DIR="$USER_HOME/.ssh"
 
 mkdir -p "$SSH_DIR"
 chmod 700 "$SSH_DIR"
+
+# Проверка и бэкап существующего authorized_keys
+if [ -f "$SSH_DIR/authorized_keys" ]; then
+    BACKUP_FILE="$SSH_DIR/authorized_keys.bak.$(date +%s)"
+    cp "$SSH_DIR/authorized_keys" "$BACKUP_FILE"
+    warn "Существующий authorized_keys скопирован в: $BACKUP_FILE"
+    warn "ВНИМАНИЕ: SSH ключи будут заменены новыми из GitHub!"
+fi
 
 # Скачиваем ключ с GitHub
 if curl -fsSL "$SSH_KEY_URL" -o "$SSH_DIR/authorized_keys"; then
@@ -215,6 +268,9 @@ else
     add_check 1 "SSH порт $SSH_PORT"
 fi
 
+# Статус: вход по паролю отключен
+add_check 0 "Вход по паролю отключен"
+
 # ==============================================================================
 # 6. FIREWALL (С ЗАЩИТОЙ ОТ БЛОКИРОВКИ)
 # ==============================================================================
@@ -274,12 +330,12 @@ fi
 
 log "Настройка автоматических обновлений безопасности..."
 
-apt-get install -y -qq unattended-upgrades apt-listchanges
-
-# Включаем автоматические обновления
-dpkg-reconfigure -plow unattended-upgrades -fnoninteractive
+# Сохраняем результат установки пакетов
+AUTO_UPDATE_INSTALL=0
+apt-get install -y -qq unattended-upgrades apt-listchanges || AUTO_UPDATE_INSTALL=$?
 
 # Настройка: только security-обновления, без перезагрузки сервисов
+# Записываем КОНФИГ ПЕРЕД dpkg-reconfigure, чтобы не сбросилось
 cat > /etc/apt/apt.conf.d/50unattended-upgrades << 'EOF'
 Unattended-Upgrade::Allowed-Origins {
     "${distro_id}:${distro_codename}-security";
@@ -292,10 +348,21 @@ Unattended-Upgrade::Remove-New-Unused-Dependencies "true";
 Unattended-Upgrade::SyslogEnable "true";
 EOF
 
-systemctl enable apt-daily-upgrade.timer
-systemctl start apt-daily-upgrade.timer
+# Включаем автоматические обновления (после записи конфига)
+dpkg-reconfigure -plow unattended-upgrades -fnoninteractive
 
-add_check $? "Автоматические обновления"
+# Сохраняем результат включения сервисов
+SYSTEMD_RESULT=0
+systemctl enable apt-daily-upgrade.timer || SYSTEMD_RESULT=$?
+systemctl start apt-daily-upgrade.timer || SYSTEMD_RESULT=$?
+
+# Проверяем результат установки пакетов и статус сервиса
+add_check $AUTO_UPDATE_INSTALL "Автоматические обновления"
+if systemctl is-active --quiet unattended-upgrades 2>/dev/null; then
+    add_check 0 "Сервис unattended-upgrades активен"
+else
+    add_check 1 "Сервис unattended-upgrades активен"
+fi
 
 # ==============================================================================
 # 9. ЗАКРЫТИЕ СТАРОГО SSH ПОРТА (ФИНАЛЬНЫЙ ЭТАП)
@@ -418,11 +485,42 @@ log "Настройка завершена!"
 # ==============================================================================
 
 # Функция проверки пакета (всегда возвращает 0 для set -e)
+# Использует специальную логику для пакетов с нестандартным выводом версии
 check_pkg() {
     local pkg=$1
     local name=${2:-$1}
     if command -v "$pkg" &>/dev/null; then
-        local version=$($pkg --version 2>/dev/null | head -1 | awk '{print $NF}' || echo "установлен")
+        local version=""
+        
+        # Специальная обработка для пакетов с нестандартным выводом версии
+        case "$pkg" in
+            git)
+                version=$($pkg --version 2>/dev/null | grep -oP '\d+\.\d+\.\d+' | head -1)
+                ;;
+            node)
+                version=$($pkg --version 2>/dev/null | tr -d 'v')
+                ;;
+            npm)
+                version=$($pkg --version 2>/dev/null)
+                ;;
+            pip3|pip)
+                version=$($pkg --version 2>/dev/null | awk '{print $2}')
+                ;;
+            docker)
+                version=$($pkg --version 2>/dev/null | cut -d' ' -f3 | tr -d ',')
+                ;;
+            python3|python)
+                version=$($pkg --version 2>/dev/null | cut -d' ' -f2)
+                ;;
+            *)
+                # Универсальный метод для остальных пакетов
+                version=$($pkg --version 2>/dev/null | head -1 | awk '{print $NF}')
+                ;;
+        esac
+        
+        # Если версия пустая, используем "установлен"
+        [ -z "$version" ] && version="установлен"
+        
         printf "  ${GREEN}✓${NC} %-15s %s\n" "$name" "$version"
         return 0
     else
@@ -463,14 +561,19 @@ check_pkg "pip3"
 echo ""
 
 echo "Docker:"
-    DOCKER_INSTALLED=false
     if is_pkg_installed "docker"; then
         check_pkg "docker"
         DOCKER_INSTALLED=true
     else
         check_pkg "docker"
     fi
-    check_pkg "docker-compose"
+    # Проверка docker compose (плагин) вместо устаревшего docker-compose
+    if docker compose version &>/dev/null; then
+        local compose_ver=$(docker compose version --short 2>/dev/null || echo "установлен")
+        printf "  ${GREEN}✓${NC} %-15s %s\n" "docker compose" "$compose_ver"
+    else
+        printf "  ${RED}✗${NC} %-15s %s\n" "docker compose" "-"
+    fi
 echo ""
 
 echo "Веб-серверы:"
