@@ -552,7 +552,7 @@ check_service() {
 # Проверка Docker отдельно
 echo ""
 echo "╔════════════════════════════════════════════════════════════╗"
-echo "║         ПРОВЕРКА ПРЕДУСТАНОВЛЕННЫХ ПАКЕТОВ                ║"
+echo "║         ПРОВЕРКА ПРЕДУСТАНОВЛЕННЫХ ПАКЕТОВ                 ║"
 echo "╚════════════════════════════════════════════════════════════╝"
 echo ""
 
@@ -569,14 +569,7 @@ echo "Docker:"
         check_pkg "docker"
     fi
     # Проверка docker compose (плагин) вместо устаревшего docker-compose
-#    if docker compose version &>/dev/null; then
-#        local compose_ver
-#        compose_ver=$(docker compose version --short 2>/dev/null || echo "установлен")
-#        printf "  ${GREEN}✓${NC} %-15s %s\n" "docker compose" "$compose_ver"
-#    else
-#        printf "  ${RED}✗${NC} %-15s %s\n" "docker compose" "-"
-#    fi
-echo ""
+    # Блок удален
 
 echo "Веб-серверы:"
 check_service "nginx" "nginx"
