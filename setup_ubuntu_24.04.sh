@@ -504,6 +504,7 @@ check_pkg() {
                 version=$($pkg --version 2>/dev/null)
                 ;;
             pip3|pip)
+                # pip3 --version: "pip 21.2 from /path (python 3.10)" - версия первое слово
                 version=$($pkg --version 2>/dev/null | awk '{print $2}')
                 ;;
             docker)
@@ -569,7 +570,8 @@ echo "Docker:"
     fi
     # Проверка docker compose (плагин) вместо устаревшего docker-compose
     if docker compose version &>/dev/null; then
-        local compose_ver=$(docker compose version --short 2>/dev/null || echo "установлен")
+        local compose_ver
+        compose_ver=$(docker compose version --short 2>/dev/null || echo "установлен")
         printf "  ${GREEN}✓${NC} %-15s %s\n" "docker compose" "$compose_ver"
     else
         printf "  ${RED}✗${NC} %-15s %s\n" "docker compose" "-"
