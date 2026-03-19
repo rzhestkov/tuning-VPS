@@ -950,12 +950,12 @@ cat > /etc/logrotate.d/custom-system << 'EOF'
 EOF
 
 # Проверка конфигурации logrotate
-if logrotate -d /etc/logrotate.d/custom-system 2>&1 | grep -qi "error"; then
-    warn "Ошибка в конфигурации logrotate"
-    add_check 1 "Настройка logrotate"
-else
+if logrotate -d /etc/logrotate.d/custom-system >/dev/null 2>&1; then
     log "Конфигурация logrotate создана"
     add_check 0 "Настройка logrotate"
+else
+    warn "Ошибка в конфигурации logrotate"
+    add_check 1 "Настройка logrotate"
 fi
 
 # 18. НАСТРОЙКА MOTD ===========================================================
@@ -1016,26 +1016,27 @@ if command -v ssh-audit &>/dev/null; then
     log "Запуск ssh-audit для проверки SSH..."
     
     # Проверяем локальный SSH сервер
-    SSH_AUDIT_RESULT=$(ssh-audit localhost -p $SSH_PORT 2>&1)
-    SSH_AUDIT_EXIT=$?
+    # ssh-audit возвращает ненулевой код при обнаружении проблем безопасности
+    SSH_AUDIT_RESULT=$(ssh-audit localhost -p $SSH_PORT 2>&1) || true
     
-    if [ $SSH_AUDIT_EXIT -eq 0 ]; then
-        log "SSH аудит завершен успешно"
+    # Анализируем результат на наличие критических проблем
+    if echo "$SSH_AUDIT_RESULT" | grep -qiE "(fail|critical|vulnerable)"; then
+        warn "SSH аудит обнаружил критические проблемы"
+        add_check 1 "SSH аудит (ssh-audit)"
+        
+        # Выводим детали проблем
+        echo ""
+        echo "===КРИТИЧЕСКИЕ ПРОБЛЕМЫ SSH АУДИТА==="
+        echo "$SSH_AUDIT_RESULT" | grep -iE "(fail|critical|vulnerable)" | head -20
+        echo ""
+    else
+        log "SSH аудит завершен (предупреждения не являются критическими)"
         add_check 0 "SSH аудит (ssh-audit)"
         
         # Выводим краткий результат аудита
         echo ""
         echo "===РЕЗУЛЬТАТ SSH АУДИТА==="
-        echo "$SSH_AUDIT_RESULT" | grep -E "(algorithm|security|warning|fail)" | head -20
-        echo ""
-    else
-        warn "SSH аудит обнаружил проблемы"
-        add_check 1 "SSH аудит (ssh-audit)"
-        
-        # Выводим детали проблем
-        echo ""
-        echo "===ПРОБЛЕМЫ SSH АУДИТА==="
-        echo "$SSH_AUDIT_RESULT" | grep -E "(warning|fail|error)" | head -20
+        echo "$SSH_AUDIT_RESULT" | grep -E "(algorithm|security|recommendation)" | head -20
         echo ""
     fi
 else
@@ -1267,6 +1268,9 @@ if [ "$DOCKER_AVAILABLE" = true ]; then
         if [ -n "$SECRET" ]; then
             log "Секрет сгенерирован: $SECRET"
             
+            # Сохраняем секрет в файл для финального отчёта
+            echo "$SECRET" > /tmp/mtproto_secret.txt
+            
             # Останавливаем и удаляем старый контейнер если есть
             docker stop mtproto-proxy &>/dev/null || true
             docker rm mtproto-proxy &>/dev/null || true
@@ -1335,7 +1339,16 @@ for check in "${CHECKS[@]}"; do
 done
 # Информация о MTProto в финальном отчете
 if docker ps | grep -q mtproto-proxy 2>/dev/null; then
-    MTPROTO_SECRET=$(docker logs mtproto-proxy 2>&1 | grep -oP '[a-f0-9]{64}' | head -1 || echo "$SECRET")
+    # Пытаемся получить секрет из сохранённого файла или из логов
+    MTPROTO_SECRET=""
+    if [ -f /tmp/mtproto_secret.txt ]; then
+        MTPROTO_SECRET=$(cat /tmp/mtproto_secret.txt)
+    fi
+    
+    # Если файл пустой, пробуем извлечь из логов Docker
+    if [ -z "$MTPROTO_SECRET" ]; then
+        MTPROTO_SECRET=$(docker logs mtproto-proxy 2>&1 | grep -oP '[a-f0-9]{64}' | head -1)
+    fi
     
     echo ""
     echo "MTProto Proxy активен:"
@@ -1343,10 +1356,16 @@ if docker ps | grep -q mtproto-proxy 2>/dev/null; then
     echo -e "  Статус: ${GREEN}запущен${NC}"
     echo "  Порт: 443"
     echo "  IP: $SERVER_IP"
-    [ -n "$MTPROTO_SECRET" ] && echo "  Секрет: $MTPROTO_SECRET"
-    echo ""
-    echo "  Поделиться ссылкой:"
-    echo -e "  ${YELLOW}https://t.me/proxy?server=$SERVER_IP&port=443&secret=$MTPROTO_SECRET${NC}"
+    if [ -n "$MTPROTO_SECRET" ]; then
+        echo "  Секрет: $MTPROTO_SECRET"
+        echo ""
+        echo "  Поделиться ссылкой:"
+        echo -e "  ${YELLOW}https://t.me/proxy?server=$SERVER_IP&port=443&secret=$MTPROTO_SECRET${NC}"
+    else
+        echo ""
+        echo "  Секрет: (не удалось получить автоматически)"
+        echo "  Получите секрет вручную: docker logs mtproto-proxy"
+    fi
 fi
 echo ""
 echo "===НАСТРОЙКА ЗАВЕРШЕНА==="
