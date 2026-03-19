@@ -929,6 +929,7 @@ cat > /etc/logrotate.d/custom-system << 'EOF'
     compress
     delaycompress
     notifempty
+    su root adm
     create 0640 root adm
     sharedscripts
     postrotate
@@ -944,6 +945,7 @@ cat > /etc/logrotate.d/custom-system << 'EOF'
     compress
     delaycompress
     notifempty
+    su www-data adm
     create 0640 www-data adm
     sharedscripts
     postrotate
