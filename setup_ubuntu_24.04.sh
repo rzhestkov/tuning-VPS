@@ -496,8 +496,8 @@ MaxAuthTries 3
 ClientAliveInterval 300
 ClientAliveCountMax 2
 
-# Безопасные хост-ключи (без ECDSA - подозрение в бэкдоре NSA)
-HostKeyAlgorithms ssh-ed25519,ssh-rsa,rsa-sha2-256,rsa-sha2-512
+# Безопасные хост-ключи (удалили ssh-rsa из-за SHA-1, оставили только современные)
+HostKeyAlgorithms ssh-ed25519,rsa-sha2-256,rsa-sha2-512
 
 # Hardening алгоритмов шифрования (защита от Terrapin CVE-2023-48795)
 KexAlgorithms curve25519-sha256,curve25519-sha256@libssh.org
