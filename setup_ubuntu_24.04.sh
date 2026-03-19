@@ -7,6 +7,7 @@
 # --- Настройки (можно изменить) ---
 NEW_USER="user1"
 SSH_PORT="2332"
+TIMEZONE="Europe/Berlin"
 GITHUB_USER="rzhestkov"
 REPO_NAME="tuning-VPS"
 SSH_KEY_URL="https://raw.githubusercontent.com/${GITHUB_USER}/${REPO_NAME}/main/ssh/authorized_keys"
@@ -167,7 +168,21 @@ if [ "$UBUNTU_VERSION" != "24.04" ]; then
     warn "Поведение может отличаться (sshd_config.d, cloud-init, ssh.socket)"
 fi
 
+# Проверка имени пользователя (пункт 33)
+if ! [[ "$NEW_USER" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]]; then
+    error "Некорректное имя пользователя: $NEW_USER"
+    error "Имя должно начинаться с буквы или подчеркивания, содержать только a-z, 0-9, _, - и быть длиной до 32 символов"
+    exit 1
+fi
+
+# Проверка номера SSH порта (пункт 34)
+if ! [[ "$SSH_PORT" =~ ^[0-9]+$ ]] || [ "$SSH_PORT" -lt 1024 ] || [ "$SSH_PORT" -gt 65535 ]; then
+    error "Некорректный SSH-порт: $SSH_PORT (допустимый диапазон: 1024–65535)"
+    exit 1
+fi
+
 # Проверка подключения к GitHub
+
 if ! curl -s --head "$SSH_KEY_URL" | head -n 1 | grep -q "200\|301\|302"; then
     error "Не могу получить доступ к GitHub. Проверьте GITHUB_USER и REPO_NAME"
     error "URL: $SSH_KEY_URL"
@@ -177,8 +192,17 @@ fi
 # 2. ОБНОВЛЕНИЕ СИСТЕМЫ =======================================================
 
 log "Обновление пакетов..."
+
+# Проверка свободного места на диске перед установкой пакетов (пункт 35)
+AVAILABLE_SPACE=$(df / --output=avail -BM | tail -1 | tr -d 'M')
+if [ "$AVAILABLE_SPACE" -lt 1024 ]; then
+    error "Недостаточно места на диске: ${AVAILABLE_SPACE}MB (нужно минимум 1GB)"
+    exit 1
+fi
+
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
+
 apt-get upgrade -y -qq
 UPDATE_RESULT=$?
 
@@ -194,8 +218,7 @@ add_check $UPDATE_RESULT "Обновление системы"
 
 log "Настройка временной зоны и синхронизации времени..."
 
-# Установка временной зоны (Европа/Берлин)
-TIMEZONE="Europe/Berlin"
+# Установка временной зоны (используется TIMEZONE из настроек)
 log "Установка временной зоны: $TIMEZONE"
 timedatectl set-timezone "$TIMEZONE" 2>/dev/null || true
 
@@ -387,6 +410,10 @@ net.ipv4.conf.all.accept_redirects = 0
 net.ipv4.conf.default.secure_redirects = 0
 net.ipv4.conf.all.secure_redirects = 0
 net.ipv4.icmp_ignore_bogus_error_responses = 1
+
+# Автоматическая перезагрузка при kernel panic
+kernel.panic = 10
+kernel.panic_on_oops = 1
 EOF
 
 # Применение настроек
@@ -475,7 +502,12 @@ if [ -d "/etc/update-motd.d" ]; then
     chmod -x /etc/update-motd.d/* 2>/dev/null || true
 fi
 
-log "MOTD настроен"
+# Добавляем PrintMotd no в sshd_config (надежное отключение MOTD)
+if ! grep -q "^PrintMotd no" /etc/ssh/sshd_config.d/99-custom.conf 2>/dev/null; then
+    echo "PrintMotd no" >> /etc/ssh/sshd_config.d/99-custom.conf
+fi
+
+log "MOTD настроен (динамический MOTD отключен)"
 add_check 0 "Настройка MOTD"
 
 # 9. ОТКЛЮЧЕНИЕ НЕНУЖНЫХ СИСТЕМНЫХ СЕРВИСОВ ==================================
@@ -584,7 +616,15 @@ if [ "$USER_CREATED" = true ]; then
     log "Настройка sudo без пароля..."
     echo "$NEW_USER ALL=(ALL:ALL) NOPASSWD: ALL" > /etc/sudoers.d/99-$NEW_USER
     chmod 440 /etc/sudoers.d/99-$NEW_USER
+    
+    # Проверка валидности sudoers файла через visudo (пункт 32)
+    visudo -c -f /etc/sudoers.d/99-$NEW_USER || {
+        error "Невалидный sudoers файл!"
+        rm -f /etc/sudoers.d/99-$NEW_USER
+        exit 1
+    }
 fi
+
 
 if [ "$USER_EXISTS" = true ]; then
     add_check 0 "Пользователь $NEW_USER (уже существует)"
@@ -652,6 +692,11 @@ PermitRootLogin prohibit-password
 MaxAuthTries 3
 ClientAliveInterval 300
 ClientAliveCountMax 2
+
+# Hardening алгоритмов шифрования
+KexAlgorithms curve25519-sha256,curve25519-sha256@libssh.org
+Ciphers chacha20-poly1305@openssh.com,aes256-gcm@openssh.com
+MACs hmac-sha2-256-etm@openssh.com,hmac-sha2-512-etm@openssh.com
 EOF
 
 # 12.3 Проверка конфигурации
@@ -703,9 +748,6 @@ ufw disable 2>/dev/null || true
 ufw default deny incoming
 ufw default allow outgoing
 
-# Удаляем только стандартное SSH правило для порта 22, оставляем остальные
-ufw delete allow 22/tcp 2>/dev/null || true
-
 # Разрешаем новый SSH порт ПЕРЕД включением файрвола!
 if ! ufw_rule_exists "$SSH_PORT/tcp"; then
     ufw allow "$SSH_PORT/tcp" comment 'SSH Custom Port'
@@ -748,14 +790,18 @@ log "Настройка fail2ban..."
 # Установка fail2ban
 apt-get install -y -qq fail2ban
 
-# Создание кастомного конфига для SSH
+# Создание кастомного конфига для SSH с прогрессивным баном
+# Используем systemd backend для Ubuntu 24.04 (journald)
 cat > /etc/fail2ban/jail.d/99-ssh-custom.conf << EOF
 [sshd]
 enabled = true
 port = $SSH_PORT
-logpath = /var/log/auth.log
+backend = systemd
 maxretry = 3
-bantime = 3600
+bantime = 86400
+bantime.increment = true
+bantime.multiplier = 2
+bantime.maxtime = 604800
 findtime = 600
 ignoreip = 127.0.0.1/8 ::1
 EOF
@@ -785,7 +831,7 @@ log "Настройка автоматических обновлений без
 AUTO_UPDATE_INSTALL=0
 apt-get install -y -qq unattended-upgrades apt-listchanges || AUTO_UPDATE_INSTALL=$?
 
-# Настройка: только security-обновления, без перезагрузки сервисов
+# Настройка: только security-обновления, с явным управлением перезагрузкой
 # Записываем КОНФИГ ПЕРЕД dpkg-reconfigure, чтобы не сбросилось
 cat > /etc/apt/apt.conf.d/50unattended-upgrades << 'EOF'
 Unattended-Upgrade::Allowed-Origins {
@@ -797,6 +843,9 @@ Unattended-Upgrade::InstallOnShutdown "false";
 Unattended-Upgrade::Remove-Unused-Dependencies "true";
 Unattended-Upgrade::Remove-New-Unused-Dependencies "true";
 Unattended-Upgrade::SyslogEnable "true";
+# Отключаем автоматическую перезагрузку (управление перезагрузкой вручную)
+Unattended-Upgrade::Automatic-Reboot "false";
+Unattended-Upgrade::Automatic-Reboot-Time "03:00";
 EOF
 
 # Включаем автоматические обновления (после записи конфига)
@@ -815,32 +864,194 @@ else
     add_check 1 "Сервис unattended-upgrades активен"
 fi
 
-# 16. ЗАКРЫТИЕ СТАРОГО SSH ПОРТА (ФИНАЛЬНЫЙ ЭТАП) =============================
+# 16. НАСТРОЙКА NEEDRESTART (АВТОМАТИЧЕСКИЙ ПЕРЕЗАПУСК СЕРВИСОВ) =============
+
+log "Настройка needrestart (автоматический перезапуск сервисов)..."
+
+# Установка needrestart (обычно уже установлен в Ubuntu 24.04)
+apt-get install -y -qq needrestart 2>/dev/null || true
+
+# Создание конфига с автоматическим перезапуском сервисов
+mkdir -p /etc/needrestart/conf.d
+cat > /etc/needrestart/conf.d/99-auto.conf << 'EOF'
+# Автоматический перезапуск сервисов при обновлении (без интерактивного режима)
+$nrconf{restart} = 'a';
+EOF
+
+# Проверка, что конфиг создан
+if [ -f "/etc/needrestart/conf.d/99-auto.conf" ]; then
+    log "Конфигурация needrestart создана"
+    add_check 0 "Настройка needrestart"
+else
+    warn "Не удалось создать конфигурацию needrestart"
+    add_check 1 "Настройка needrestart"
+fi
+
+# 17. НАСТРОЙКА AUDITD (АУДИТ ДЕЙСТВИЙ) =======================================
+
+log "Настройка auditd (аудит действий)..."
+
+# Установка auditd
+apt-get install -y -qq auditd audispd-plugins
+
+# Включение и запуск auditd
+systemctl enable auditd 2>/dev/null || true
+systemctl start auditd 2>/dev/null || true
+
+# Проверка статуса auditd
+if systemctl is-active auditd &>/dev/null; then
+    log "Auditd установлен и запущен"
+    add_check 0 "Установка auditd"
+else
+    warn "Не удалось запустить auditd"
+    add_check 1 "Установка auditd"
+fi
+
+# Настройка правил аудита для важных событий
+cat > /etc/audit/rules.d/99-custom.rules << 'EOF'
+# Аудит изменений в системных файлах
+-w /etc/passwd -p wa -k identity
+-w /etc/group -p wa -k identity
+-w /etc/shadow -p wa -k identity
+-w /etc/sudoers -p wa -k identity
+
+# Аудит изменений в SSH конфигурации
+-w /etc/ssh/sshd_config -p wa -k sshd_config
+-w /etc/ssh/sshd_config.d/ -p wa -k sshd_config
+
+# Аудит входов в систему
+-w /var/log/auth.log -p wa -k auth_log
+
+# Аудит выполнения команд
+-w /bin/bash -p x -k bash_execution
+-w /usr/bin/bash -p x -k bash_execution
+
+# Аудит изменений в cron
+-w /etc/cron.d -p wa -k cron
+-w /etc/cron.daily -p wa -k cron
+-w /etc/cron.hourly -p wa -k cron
+-w /etc/cron.monthly -p wa -k cron
+-w /etc/cron.weekly -p wa -k cron
+-w /etc/crontab -p wa -k cron
+
+# Аудит загрузки системы
+-w /etc/init.d -p wa -k init
+-w /etc/rc.local -p wa -k init
+
+# Аудит сетевых подключений
+-a always,exit -F arch=b64 -S connect -k network_connect
+-a always,exit -F arch=b64 -S accept -k network_connect
+
+# Аудит важных системных вызовов
+-a always,exit -F arch=b64 -S execve -k execution
+-a always,exit -F arch=b64 -S open -k file_access
+-a always,exit -F arch=b64 -S openat -k file_access
+-a always,exit -F arch=b64 -S unlink -k file_deletion
+-a always,exit -F arch=b64 -S rename -k file_modification
+EOF
+
+# Применение правил auditd
+augenrules --load 2>/dev/null || true
+
+# Перезапуск auditd для применения правил
+systemctl restart auditd 2>/dev/null || true
+
+log "Правила аудита настроены"
+add_check 0 "Настройка правил аудита"
+
+# 18. ЗАКРЫТИЕ СТАРОГО SSH ПОРТА (ФИНАЛЬНЫЙ ЭТАП) =============================
+
+# Функция проверки SSH-валидации перед закрытием порта 22 (пункт 31)
+# Возвращает 0 если все проверки пройдены, 1 в противном случае
+validate_ssh_for_port_close() {
+    local SSH_DIR="/home/$NEW_USER/.ssh"
+    local AUTH_KEYS="$SSH_DIR/authorized_keys"
+    local errors=0
+    
+    # Проверка 1: файл authorized_keys существует
+    if [ ! -f "$AUTH_KEYS" ]; then
+        error "Файл authorized_keys не существует: $AUTH_KEYS"
+        log "Порт 22 не будет закрыт автоматически из-за отсутствия SSH-ключей"
+        return 1
+    fi
+    
+    # Проверка 2: файл authorized_keys не пустой
+    if [ ! -s "$AUTH_KEYS" ]; then
+        error "Файл authorized_keys пустой: $AUTH_KEYS"
+        log "Порт 22 не будет закрыт автоматически из-за пустого authorized_keys"
+        return 1
+    fi
+    
+    # Проверка 3: SSH слушает новый порт
+    if ! ss -tlnp 2>/dev/null | grep -qE ":$SSH_PORT "; then
+        error "SSH не слушает порт $SSH_PORT"
+        log "Проверьте: sudo ss -tlnp | grep ssh"
+        return 1
+    fi
+    
+    # Проверка 4: содержимое authorized_keys валидно
+    local has_valid_key=false
+    while IFS= read -r line; do
+        # Пропускаем пустые строки и комментарии
+        [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+        
+        # Проверяем формат SSH-ключа (ssh-rsa, ssh-ed25519, ecdsa-sha2*, ssh-dss)
+        if [[ "$line" =~ ^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp256|ecdsa-sha2-nistp384|ecdsa-sha2-nistp521|ssh-dss) ]]; then
+            has_valid_key=true
+            log "Найден валидный SSH-ключ типа: ${BASH_REMATCH[1]}"
+            break
+        fi
+    done < "$AUTH_KEYS"
+    
+    if [ "$has_valid_key" = false ]; then
+        error "В authorized_keys не найдено валидных SSH-ключей"
+        log "Файл должен содержать ключи в форматах: ssh-ed25519, ssh-rsa, ecdsa-sha2-*, ssh-dss"
+        return 1
+    fi
+    
+    return 0
+}
 
 if is_port_22_closed; then
     log "Порт 22 уже закрыт, пропускаем"
     add_check 0 "Закрытие порта 22 (уже закрыт)"
 else
-    warn "ВНИМАНИЕ! Сейчас будет закрыт порт 22."
-    warn "Перед продолжением:"
-    warn "1. Откройте НОВОЕ окно терминала"
-    warn "2. Подключитесь: ssh -p $SSH_PORT $NEW_USER@$(hostname -I | awk '{print $1}')"
-    warn "3. Убедитесь, что подключение работает!"
-    warn ""
-    read -p "Подключение работает? Закрыть порт 22? (yes/no): " confirm
+    # Автоматические проверки перед закрытием порта 22 (пункт 31)
+    SSH_VALIDATION_PASSED=true
+    if ! validate_ssh_for_port_close; then
+        SSH_VALIDATION_PASSED=false
+        warn "АВТОМАТИЧЕСКИЕ ПРОВЕРКИ SSH НЕ ПРОЙДЕНЫ!"
+        warn "Порт 22 будет оставлен ОТКРЫТЫМ для предотвращения блокировки."
+        add_check 1 "Закрытие порта 22 (автоматические проверки не пройдены)"
+    fi
+    
+    # Продолжаем только если автоматические проверки прошли успешно
+    if [ "$SSH_VALIDATION_PASSED" = true ]; then
+        warn "ВНИМАНИЕ! Автоматические проверки SSH пройдены успешно:"
+        warn "  ✓ authorized_keys существует и не пустой"
+        warn "  ✓ SSH слушает новый порт $SSH_PORT"
+        warn "  ✓ Валидный SSH-ключ присутствует"
+        warn ""
+        warn "Перед продолжением дополнительно проверьте:"
+        warn "1. Откройте НОВОЕ окно терминала"
+        warn "2. Подключитесь: ssh -p $SSH_PORT $NEW_USER@$(hostname -I | awk '{print $1}')"
+        warn "3. Убедитесь, что подключение работает!"
+        warn ""
+        read -p "Подключение работает? Закрыть порт 22? (yes/no): " confirm
 
-    if [ "$confirm" = "yes" ]; then
-        ufw delete allow 22/tcp 2>/dev/null || true
-        log "Порт 22 закрыт"
-        add_check 0 "Закрытие порта 22"
-    else
-        warn "Порт 22 оставлен открытым! Закройте его вручную позже:"
-        warn "sudo ufw delete allow 22/tcp"
-        add_check 1 "Закрытие порта 22 (отложено)"
+        if [ "$confirm" = "yes" ]; then
+            ufw delete allow 22/tcp 2>/dev/null || true
+            log "Порт 22 закрыт"
+            add_check 0 "Закрытие порта 22"
+        else
+            warn "Порт 22 оставлен открытым! Закройте его вручную позже:"
+            warn "sudo ufw delete allow 22/tcp"
+            add_check 1 "Закрытие порта 22 (отложено)"
+        fi
     fi
 fi
 
-# 17. ДИАГНОСТИКА И ОТЧЕТ =====================================================
+# 19. ДИАГНОСТИКА И ОТЧЕТ =====================================================
 
 echo ""
 echo "===ОТЧЕТ О НАСТРОЙКЕ==="
@@ -1045,7 +1256,7 @@ echo "  Память:"
 free -h | grep "Mem:" | awk '{printf "    Всего: %s, Свободно: %s, Использовано: %s\n", $2, $4, $3}'
 echo ""
 
-# УСТАНОВКА DOCKER (ОПЦИОНАЛЬНО)
+# 20. УСТАНОВКА DOCKER (ОПЦИОНАЛЬНО)
 
 if [ "$DOCKER_INSTALLED" = false ]; then
     echo ""
@@ -1097,7 +1308,7 @@ if [ "$DOCKER_INSTALLED" = false ]; then
 else
     log "Docker уже установлен, пропускаем установку"
 fi
-# УСТАНОВКА MTPROTO PROXY (ОПЦИОНАЛЬНО)
+# 21. УСТАНОВКА MTPROTO PROXY (ОПЦИОНАЛЬНО)
 
 # Проверяем, доступен ли Docker (установлен ли он только что или ранее)
 DOCKER_AVAILABLE=false
@@ -1215,3 +1426,42 @@ fi
 echo ""
 echo "===НАСТРОЙКА ЗАВЕРШЕНА==="
 echo ""
+
+# 22. ПРОВЕРКА SSH С ПОМОЩЬЮ SSH-AUDIT ========================================
+
+log "Установка и проверка SSH с помощью ssh-audit..."
+
+# Установка ssh-audit
+apt-get install -y -qq ssh-audit
+
+# Проверка SSH конфигурации с помощью ssh-audit
+if command -v ssh-audit &>/dev/null; then
+    log "Запуск ssh-audit для проверки SSH..."
+    
+    # Проверяем локальный SSH сервер
+    SSH_AUDIT_RESULT=$(ssh-audit localhost -p $SSH_PORT 2>&1)
+    SSH_AUDIT_EXIT=$?
+    
+    if [ $SSH_AUDIT_EXIT -eq 0 ]; then
+        log "SSH аудит завершен успешно"
+        add_check 0 "SSH аудит (ssh-audit)"
+        
+        # Выводим краткий результат аудита
+        echo ""
+        echo "===РЕЗУЛЬТАТ SSH АУДИТА==="
+        echo "$SSH_AUDIT_RESULT" | grep -E "(algorithm|security|warning|fail)" | head -20
+        echo ""
+    else
+        warn "SSH аудит обнаружил проблемы"
+        add_check 1 "SSH аудит (ssh-audit)"
+        
+        # Выводим детали проблем
+        echo ""
+        echo "===ПРОБЛЕМЫ SSH АУДИТА==="
+        echo "$SSH_AUDIT_RESULT" | grep -E "(warning|fail|error)" | head -20
+        echo ""
+    fi
+else
+    warn "ssh-audit не установлен"
+    add_check 1 "SSH аудит (ssh-audit)"
+fi
