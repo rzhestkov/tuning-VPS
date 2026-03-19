@@ -5,25 +5,29 @@
 
 ## ⚡ Быстрый старт (Ubuntu 24.04)
 
- 1. Подключитесь к серверу как root
+ 1. Подключитесь к серверу как root. На своем компьютере:
 ```bash
 ssh root@YOUR_SERVER_IP
 ```
 
-2. Скачайте скрипт
+2. Скачайте скрипт. На сервере после подключения:
 ```bash
 curl -fsSL https://raw.githubusercontent.com/rzhestkov/tuning-VPS/main/setup_ubuntu_24.04.sh -o setup.sh
 ```
 
-# 3. Запустите
+3. Запустите
 ```bash
 sudo bash setup.sh
 ```
 
 ## 📁 Обновление проекта в репозиториях
 
+```bash
 git push origin main   # в Gitea
+```
+```bash
 git push github main   # в GitHub
+```
 
 ## 📁 Структура проекта
 

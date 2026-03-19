@@ -496,10 +496,13 @@ MaxAuthTries 3
 ClientAliveInterval 300
 ClientAliveCountMax 2
 
-# Hardening алгоритмов шифрования
+# Безопасные хост-ключи (без ECDSA - подозрение в бэкдоре NSA)
+HostKeyAlgorithms ssh-ed25519,ssh-rsa,rsa-sha2-256,rsa-sha2-512
+
+# Hardening алгоритмов шифрования (защита от Terrapin CVE-2023-48795)
 KexAlgorithms curve25519-sha256,curve25519-sha256@libssh.org
-Ciphers chacha20-poly1305@openssh.com,aes256-gcm@openssh.com
-MACs hmac-sha2-256-etm@openssh.com,hmac-sha2-512-etm@openssh.com
+Ciphers chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.com
+MACs hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com
 EOF
 
 # 09.3 Проверка конфигурации
@@ -949,12 +952,21 @@ cat > /etc/logrotate.d/custom-system << 'EOF'
 }
 EOF
 
-# Проверка конфигурации logrotate
-if logrotate -d /etc/logrotate.d/custom-system >/dev/null 2>&1; then
+# Проверка конфигурации logrotate с диагностикой
+log "Проверка конфигурации logrotate..."
+LOGROTATE_DEBUG=$(logrotate -d /etc/logrotate.d/custom-system 2>&1)
+LOGROTATE_EXIT=$?
+
+if [ $LOGROTATE_EXIT -eq 0 ]; then
     log "Конфигурация logrotate создана"
     add_check 0 "Настройка logrotate"
 else
-    warn "Ошибка в конфигурации logrotate"
+    warn "Ошибка в конфигурации logrotate (код: $LOGROTATE_EXIT)"
+    echo ""
+    echo "===ДИАГНОСТИКА LOGROTATE==="
+    echo "$LOGROTATE_DEBUG"
+    echo "==========================="
+    echo ""
     add_check 1 "Настройка logrotate"
 fi
 
