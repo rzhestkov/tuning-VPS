@@ -47,27 +47,6 @@ ufw_rule_exists() {
     return $?
 }
 
-# Функция проверки закрыт ли порт 22
-# Проверяет и UFW правила, и реальное состояние сокета
-is_port_22_closed() {
-    # Проверяем UFW правило
-    local ufw_closed=false
-    if ! ufw status | grep -q "22/tcp"; then
-        ufw_closed=true
-    fi
-    
-    # Проверяем реальное состояние сокета (слушает ли какой-то сервис порт 22)
-    # ss -tlnp показывает только LISTENING сокеты, не ESTABLISHED соединения
-    local socket_closed=false
-    # Более надежная проверка: ищем порт 22 в любом формате (0.0.0.0:22, *:22, 127.0.0.1:22)
-    if ! ss -tlnp 2>/dev/null | grep -qE '(:22\s|\.22\s)'; then
-        socket_closed=true
-    fi
-    
-    # Порт считается закрытым, если закрыт и в UFW, и в сокете
-    $ufw_closed && $socket_closed
-}
-
 # Функция добавления результата проверки
 add_check() {
     local status=$1
@@ -123,11 +102,6 @@ check_pkg() {
         printf "  ${RED}✗${NC} %-15s %s\n" "$name" "-"
         return 0
     fi
-}
-
-# Функция проверки наличия пакета (для условий, возвращает 0/1)
-is_pkg_installed() {
-    command -v "$1" &>/dev/null
 }
 
 # Функция проверки сервиса (всегда возвращает 0 для set -e)
@@ -614,65 +588,68 @@ fi
 
 # 11. ЗАКРЫТИЕ СТАРОГО SSH ПОРТА (ФИНАЛЬНЫЙ ЭТАП) =============================
 
-# Функция проверки SSH-валидации перед закрытием порта 22 (пункт 31)
-# Возвращает 0 если все проверки пройдены, 1 в противном случае
-validate_ssh_for_port_close() {
-    local SSH_DIR="/home/$NEW_USER/.ssh"
-    local AUTH_KEYS="$SSH_DIR/authorized_keys"
-    local errors=0
-    
-    # Проверка 1: файл authorized_keys существует
-    if [ ! -f "$AUTH_KEYS" ]; then
-        error "Файл authorized_keys не существует: $AUTH_KEYS"
-        log "Порт 22 не будет закрыт автоматически из-за отсутствия SSH-ключей"
-        return 1
-    fi
-    
-    # Проверка 2: файл authorized_keys не пустой
-    if [ ! -s "$AUTH_KEYS" ]; then
-        error "Файл authorized_keys пустой: $AUTH_KEYS"
-        log "Порт 22 не будет закрыт автоматически из-за пустого authorized_keys"
-        return 1
-    fi
-    
-    # Проверка 3: SSH слушает новый порт
-    if ! ss -tlnp 2>/dev/null | grep -qE ":$SSH_PORT "; then
-        error "SSH не слушает порт $SSH_PORT"
-        log "Проверьте: sudo ss -tlnp | grep ssh"
-        return 1
-    fi
-    
-    # Проверка 4: содержимое authorized_keys валидно
-    local has_valid_key=false
-    while IFS= read -r line; do
-        # Пропускаем пустые строки и комментарии
-        [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
-        
-        # Проверяем формат SSH-ключа (ssh-rsa, ssh-ed25519, ecdsa-sha2*, ssh-dss)
-        if [[ "$line" =~ ^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp256|ecdsa-sha2-nistp384|ecdsa-sha2-nistp521|ssh-dss) ]]; then
-            has_valid_key=true
-            log "Найден валидный SSH-ключ типа: ${BASH_REMATCH[1]}"
-            break
-        fi
-    done < "$AUTH_KEYS"
-    
-    if [ "$has_valid_key" = false ]; then
-        error "В authorized_keys не найдено валидных SSH-ключей"
-        log "Файл должен содержать ключи в форматах: ssh-ed25519, ssh-rsa, ecdsa-sha2-*, ssh-dss"
-        return 1
-    fi
-    
-    return 0
-}
+# Проверка, закрыт ли порт 22 (в UFW и не слушает ли сокет)
+port_22_ufw_closed=false
+port_22_socket_closed=false
+if ! ufw status | grep -q "22/tcp"; then
+    port_22_ufw_closed=true
+fi
+if ! ss -tlnp 2>/dev/null | grep -qE '(:22\s|\.22\s)'; then
+    port_22_socket_closed=true
+fi
 
-if is_port_22_closed; then
+if $port_22_ufw_closed && $port_22_socket_closed; then
     log "Порт 22 уже закрыт, пропускаем"
     add_check 0 "Закрытие порта 22 (уже закрыт)"
 else
     # Автоматические проверки перед закрытием порта 22 (пункт 31)
     SSH_VALIDATION_PASSED=true
-    if ! validate_ssh_for_port_close; then
+    
+    # Встроенная проверка SSH-валидации
+    SSH_DIR="/home/$NEW_USER/.ssh"
+    AUTH_KEYS="$SSH_DIR/authorized_keys"
+    
+    # Проверка 1: файл authorized_keys существует
+    if [ ! -f "$AUTH_KEYS" ]; then
+        error "Файл authorized_keys не существует: $AUTH_KEYS"
+        log "Порт 22 не будет закрыт автоматически из-за отсутствия SSH-ключей"
         SSH_VALIDATION_PASSED=false
+    fi
+    
+    # Проверка 2: файл authorized_keys не пустой
+    if [ "$SSH_VALIDATION_PASSED" = true ] && [ ! -s "$AUTH_KEYS" ]; then
+        error "Файл authorized_keys пустой: $AUTH_KEYS"
+        log "Порт 22 не будет закрыт автоматически из-за пустого authorized_keys"
+        SSH_VALIDATION_PASSED=false
+    fi
+    
+    # Проверка 3: SSH слушает новый порт
+    if [ "$SSH_VALIDATION_PASSED" = true ] && ! ss -tlnp 2>/dev/null | grep -qE ":$SSH_PORT "; then
+        error "SSH не слушает порт $SSH_PORT"
+        log "Проверьте: sudo ss -tlnp | grep ssh"
+        SSH_VALIDATION_PASSED=false
+    fi
+    
+    # Проверка 4: содержимое authorized_keys валидно
+    if [ "$SSH_VALIDATION_PASSED" = true ]; then
+        has_valid_key=false
+        while IFS= read -r line; do
+            [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+            if [[ "$line" =~ ^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp256|ecdsa-sha2-nistp384|ecdsa-sha2-nistp521|ssh-dss) ]]; then
+                has_valid_key=true
+                log "Найден валидный SSH-ключ типа: ${BASH_REMATCH[1]}"
+                break
+            fi
+        done < "$AUTH_KEYS"
+        
+        if [ "$has_valid_key" = false ]; then
+            error "В authorized_keys не найдено валидных SSH-ключей"
+            log "Файл должен содержать ключи в форматах: ssh-ed25519, ssh-rsa, ecdsa-sha2-*, ssh-dss"
+            SSH_VALIDATION_PASSED=false
+        fi
+    fi
+    
+    if [ "$SSH_VALIDATION_PASSED" = false ]; then
         warn "АВТОМАТИЧЕСКИЕ ПРОВЕРКИ SSH НЕ ПРОЙДЕНЫ!"
         warn "Порт 22 будет оставлен ОТКРЫТЫМ для предотвращения блокировки."
         add_check 1 "Закрытие порта 22 (автоматические проверки не пройдены)"
@@ -1147,73 +1124,6 @@ echo "  4. Логи SSH: sudo journalctl -u ssh -n 50"
 echo ""
 log "Настройка завершена!"
 
-# ФУНКЦИИ ПРОВЕРКИ ПАКЕТОВ (вспомогательные функции)
-
-# Функция проверки пакета (всегда возвращает 0 для set -e)
-# Использует специальную логику для пакетов с нестандартным выводом версии
-check_pkg() {
-    local pkg=$1
-    local name=${2:-$1}
-    if command -v "$pkg" &>/dev/null; then
-        local version=""
-        
-        # Специальная обработка для пакетов с нестандартным выводом версии
-        case "$pkg" in
-            git)
-                version=$($pkg --version 2>/dev/null | grep -oP '\d+\.\d+\.\d+' | head -1)
-                ;;
-            node)
-                version=$($pkg --version 2>/dev/null | tr -d 'v')
-                ;;
-            npm)
-                version=$($pkg --version 2>/dev/null)
-                ;;
-            pip3|pip)
-                # pip3 --version: "pip 21.2 from /path (python 3.10)" - версия первое слово
-                version=$($pkg --version 2>/dev/null | awk '{print $2}')
-                ;;
-            docker)
-                version=$($pkg --version 2>/dev/null | cut -d' ' -f3 | tr -d ',')
-                ;;
-            python3|python)
-                version=$($pkg --version 2>/dev/null | cut -d' ' -f2)
-                ;;
-            *)
-                # Универсальный метод для остальных пакетов
-                version=$($pkg --version 2>/dev/null | head -1 | awk '{print $NF}')
-                ;;
-        esac
-        
-        # Если версия пустая, используем "установлен"
-        [ -z "$version" ] && version="установлен"
-        
-        printf "  ${GREEN}✓${NC} %-15s %s\n" "$name" "$version"
-        return 0
-    else
-        printf "  ${RED}✗${NC} %-15s %s\n" "$name" "-"
-        return 0
-    fi
-}
-
-# Функция проверки наличия пакета (для условий, возвращает 0/1)
-is_pkg_installed() {
-    command -v "$1" &>/dev/null
-}
-
-# Функция проверки сервиса (всегда возвращает 0 для set -e)
-check_service() {
-    local svc=$1
-    local name=${2:-$1}
-    if systemctl is-active "$svc" &>/dev/null; then
-        printf "  ${GREEN}✓${NC} %-15s %s\n" "$name" "(active)"
-    elif dpkg -l | grep -q "^ii  $svc"; then
-        printf "  ${YELLOW}○${NC} %-15s %s\n" "$name" "(installed, stopped)"
-    else
-        printf "  ${RED}✗${NC} %-15s %s\n" "$name" "-"
-    fi
-    return 0
-}
-
 # Проверка предустановленных пакетов
 echo ""
 echo "===ПРОВЕРКА ПРЕДУСТАНОВЛЕННЫХ ПАКЕТОВ==="
@@ -1225,7 +1135,7 @@ check_pkg "pip3"
 echo ""
 
 echo "Docker:"
-    if is_pkg_installed "docker"; then
+    if command -v "docker" &>/dev/null; then
         check_pkg "docker"
         DOCKER_INSTALLED=true
     else
