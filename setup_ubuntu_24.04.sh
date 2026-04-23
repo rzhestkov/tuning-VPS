@@ -119,6 +119,12 @@ check_service() {
     return 0
 }
 
+file_contains() {
+    local file=$1
+    local pattern=$2
+    grep -qE "$pattern" "$file" 2>/dev/null
+}
+
 # 01. ПРОВЕРКИ ПЕРЕД СТАРТОМ ====================================================
 
 log "=== Начало настройки VPS ==="
@@ -237,7 +243,14 @@ if systemctl is-enabled udisks2 &>/dev/null; then
 fi
 
 log "Отключено $SERVICES_DISABLED ненужных сервисов"
-add_check 0 "Отключение ненужных сервисов"
+SERVICES_VALIDATION_OK=0
+for svc in snapd apport whoopsie lxd udisks2; do
+    if systemctl is-enabled "$svc" 2>/dev/null | grep -q "^enabled"; then
+        SERVICES_VALIDATION_OK=1
+        break
+    fi
+done
+add_check $SERVICES_VALIDATION_OK "Отключение ненужных сервисов"
 
 # 04. НАСТРОЙКА ВРЕМЕННОЙ ЗОНЫ И NTP ===========================================
 
@@ -375,7 +388,15 @@ $NEW_USER hard nproc 8192
 EOF
 
 log "Ограничения для пользователей настроены"
-add_check 0 "Ограничения для пользователей (limits.d)"
+LIMITS_VALIDATION_OK=0
+if [ -f "/etc/security/limits.d/99-custom.conf" ] && \
+   file_contains "/etc/security/limits.d/99-custom.conf" "^$NEW_USER hard nofile 65535$" && \
+   file_contains "/etc/security/limits.d/99-custom.conf" "^$NEW_USER hard nproc 8192$"; then
+    LIMITS_VALIDATION_OK=0
+else
+    LIMITS_VALIDATION_OK=1
+fi
+add_check $LIMITS_VALIDATION_OK "Ограничения для пользователей (limits.d)"
 
 # 07. СОЗДАНИЕ ПОЛЬЗОВАТЕЛЯ ====================================================
 
@@ -419,13 +440,17 @@ if [ "$USER_CREATED" = true ]; then
 fi
 
 
-if [ "$USER_EXISTS" = true ]; then
-    add_check 0 "Пользователь $NEW_USER (уже существует)"
-elif [ "$USER_CREATED" = true ]; then
-    add_check 0 "Создание пользователя $NEW_USER"
-else
-    add_check 1 "Создание пользователя $NEW_USER"
+USER_VALIDATION_OK=0
+if ! id "$NEW_USER" &>/dev/null; then
+    USER_VALIDATION_OK=1
 fi
+if ! id -nG "$NEW_USER" 2>/dev/null | tr ' ' '\n' | grep -qx "sudo"; then
+    USER_VALIDATION_OK=1
+fi
+if [ -f "/etc/sudoers.d/99-$NEW_USER" ] && ! visudo -c -f /etc/sudoers.d/99-$NEW_USER >/dev/null 2>&1; then
+    USER_VALIDATION_OK=1
+fi
+add_check $USER_VALIDATION_OK "Пользователь $NEW_USER и sudo"
 
 # 08. НАСТРОЙКА SSH КЛЮЧЕЙ =====================================================
 
@@ -450,8 +475,18 @@ if curl -fsSL "$SSH_KEY_URL" -o "$SSH_DIR/authorized_keys"; then
     chmod 600 "$SSH_DIR/authorized_keys"
     chown -R "$NEW_USER:$NEW_USER" "$SSH_DIR"
     SSH_KEYS_READY=true
+    SSH_KEY_VALIDATION_OK=0
+    if [ ! -s "$SSH_DIR/authorized_keys" ]; then
+        SSH_KEY_VALIDATION_OK=1
+    fi
+    if [ "$(stat -c '%a' "$SSH_DIR/authorized_keys" 2>/dev/null)" != "600" ]; then
+        SSH_KEY_VALIDATION_OK=1
+    fi
+    if ! file_contains "$SSH_DIR/authorized_keys" '^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp256|ecdsa-sha2-nistp384|ecdsa-sha2-nistp521)[[:space:]]'; then
+        SSH_KEY_VALIDATION_OK=1
+    fi
     log "SSH ключ установлен"
-    add_check 0 "Установка SSH ключа"
+    add_check $SSH_KEY_VALIDATION_OK "Установка SSH ключа"
 else
     error "Не удалось скачать SSH ключ"
     add_check 1 "Установка SSH ключа"
@@ -729,12 +764,15 @@ systemctl enable fail2ban 2>/dev/null || true
 
 # Проверка статуса fail2ban
 if systemctl is-active fail2ban &>/dev/null; then
+    FAIL2BAN_VALIDATION_OK=0
     log "Fail2ban установлен и запущен"
     # Проверка статуса правил SSH
     if fail2ban-client status sshd &>/dev/null; then
         log "Правила fail2ban для SSH активны"
+    else
+        FAIL2BAN_VALIDATION_OK=1
     fi
-    add_check 0 "Установка fail2ban"
+    add_check $FAIL2BAN_VALIDATION_OK "Установка fail2ban"
 else
     warn "Не удалось запустить fail2ban"
     add_check 1 "Установка fail2ban"
@@ -802,13 +840,18 @@ cat > /etc/audit/rules.d/99-custom.rules << 'EOF'
 EOF
 
 # Применение правил auditd
-augenrules --load 2>/dev/null || true
+AUGENRULES_RESULT=0
+augenrules --load >/dev/null 2>&1 || AUGENRULES_RESULT=$?
 
 # Перезапуск auditd для применения правил
 systemctl restart auditd 2>/dev/null || true
 
 log "Правила аудита настроены"
-add_check 0 "Настройка правил аудита"
+AUDIT_RULES_VALIDATION_OK=$AUGENRULES_RESULT
+if ! auditctl -l 2>/dev/null | grep -q "sshd_config"; then
+    AUDIT_RULES_VALIDATION_OK=1
+fi
+add_check $AUDIT_RULES_VALIDATION_OK "Настройка правил аудита"
 
 # 14. АВТООБНОВЛЕНИЯ ==========================================================
 
@@ -836,7 +879,8 @@ Unattended-Upgrade::Automatic-Reboot-Time "03:00";
 EOF
 
 # Включаем автоматические обновления (после записи конфига)
-dpkg-reconfigure -plow unattended-upgrades -fnoninteractive
+DPKG_RECONFIGURE_RESULT=0
+dpkg-reconfigure -plow unattended-upgrades -fnoninteractive || DPKG_RECONFIGURE_RESULT=$?
 
 # Сохраняем результат включения сервисов
 SYSTEMD_RESULT=0
@@ -852,6 +896,14 @@ if systemctl is-enabled --quiet apt-daily.timer 2>/dev/null && systemctl is-enab
 else
     add_check 1 "APT auto-update timers enabled"
 fi
+AUTO_UPDATE_CONFIG_OK=$DPKG_RECONFIGURE_RESULT
+if ! file_contains "/etc/apt/apt.conf.d/50unattended-upgrades" 'Automatic-Reboot "false"'; then
+    AUTO_UPDATE_CONFIG_OK=1
+fi
+if ! file_contains "/etc/apt/apt.conf.d/50unattended-upgrades" 'Allowed-Origins'; then
+    AUTO_UPDATE_CONFIG_OK=1
+fi
+add_check $AUTO_UPDATE_CONFIG_OK "Конфиг unattended-upgrades"
 
 # 15. НАСТРОЙКА NEEDRESTART (АВТОМАТИЧЕСКИЙ ПЕРЕЗАПУСК СЕРВИСОВ) =============
 
@@ -868,7 +920,7 @@ $nrconf{restart} = 'a';
 EOF
 
 # Проверка, что конфиг создан
-if [ -f "/etc/needrestart/conf.d/99-auto.conf" ]; then
+if [ -f "/etc/needrestart/conf.d/99-auto.conf" ] && file_contains "/etc/needrestart/conf.d/99-auto.conf" "\\\$nrconf\\{restart\\} = 'a';"; then
     log "Конфигурация needrestart создана"
     add_check 0 "Настройка needrestart"
 else
@@ -916,8 +968,15 @@ systemctl restart systemd-journald 2>/dev/null || true
 
 # Проверка, что journald работает
 if systemctl is-active systemd-journald &>/dev/null; then
+    JOURNALD_VALIDATION_OK=0
+    if ! file_contains "/etc/systemd/journald.conf" '^Storage=persistent$'; then
+        JOURNALD_VALIDATION_OK=1
+    fi
+    if ! file_contains "/etc/systemd/journald.conf" '^SystemMaxUse=500M$'; then
+        JOURNALD_VALIDATION_OK=1
+    fi
     log "Journald настроен и перезапущен"
-    add_check 0 "Настройка journald"
+    add_check $JOURNALD_VALIDATION_OK "Настройка journald"
 else
     warn "Не удалось перезапустить journald"
     add_check 1 "Настройка journald"
@@ -1031,7 +1090,14 @@ if ! grep -q "^PrintMotd no" /etc/ssh/sshd_config.d/99-custom.conf 2>/dev/null; 
 fi
 
 log "MOTD настроен (динамический MOTD отключен)"
-add_check 0 "Настройка MOTD"
+MOTD_VALIDATION_OK=0
+if [ ! -s "/etc/motd" ]; then
+    MOTD_VALIDATION_OK=1
+fi
+if ! file_contains "/etc/ssh/sshd_config.d/99-custom.conf" '^PrintMotd no$'; then
+    MOTD_VALIDATION_OK=1
+fi
+add_check $MOTD_VALIDATION_OK "Настройка MOTD"
 
 
 # 19. ПРОВЕРКА SSH С ПОМОЩЬЮ SSH-AUDIT ========================================
