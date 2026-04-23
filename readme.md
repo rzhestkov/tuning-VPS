@@ -266,6 +266,17 @@ newgrp docker
 
 ## 📝 Лог изменений
 
+- **v1.6** - Усилены проверки, повторный запуск и практичность конфигурации
+  
+  - **Post-check после секций**: добавлены дополнительные проверки результата настройки для services, limits, user/sudo, SSH keys, fail2ban, auditd, unattended-upgrades, needrestart, journald и MOTD
+  - **Повторный запуск**: улучшена диагностика для rerun-сценария и добавлен отдельный post-run чеклист в README
+  - **SSH keys**: скрипт теперь останавливается до SSH hardening, если `authorized_keys` пустой или не содержит валидный публичный ключ
+  - **Rollback SSH**: восстановление теперь учитывает не только основной `sshd_config`, но и кастомный include `99-custom.conf`
+  - **SSH hardening**: убраны слишком жёсткие ручные crypto-ограничения, оставлены более совместимые и практичные настройки
+  - **Limits**: настройки лимитов переведены в `limits.d`, без накопления дублей в `limits.conf`
+  - **Auditd**: проверки правил усилены, а набор syscall-правил сделан более практичным для VPS
+  - **Автообновления**: проверка переведена на `apt-daily*` timers и валидацию конфига `unattended-upgrades`
+
 - **v1.5** - Дополнительная настройка безопасности
   
   - **Hardening ядра**: Настройка sysctl.conf (защита от SYN-flood, отключение IP forwarding, kernel.dmesg_restrict)
