@@ -1,5 +1,46 @@
 # VPS Setup Scripts
 
+## Post-Run Чеклист Для Повторного Запуска
+
+Если вы повторно запускаете скрипт на уже настроенном сервере, после завершения полезно отдельно проверить ключевые сервисы и конфиги:
+
+```bash
+# SSH
+sudo sshd -t
+sudo systemctl status ssh
+sudo ss -tlnp | grep ssh
+
+# Firewall
+sudo ufw status verbose
+
+# Fail2ban
+sudo systemctl status fail2ban
+sudo fail2ban-client status sshd
+
+# Auditd
+sudo systemctl status auditd
+sudo auditctl -l | grep sshd_config
+
+# Автообновления
+systemctl list-timers apt-daily.timer apt-daily-upgrade.timer
+sudo grep -E "Allowed-Origins|Automatic-Reboot" /etc/apt/apt.conf.d/50unattended-upgrades
+
+# Needrestart
+sudo grep "nrconf{restart}" /etc/needrestart/conf.d/99-auto.conf
+
+# Journald
+sudo systemctl status systemd-journald
+sudo journalctl --disk-usage
+sudo grep -E "^(Storage|SystemMaxUse)" /etc/systemd/journald.conf
+
+# Logrotate
+sudo logrotate -d /etc/logrotate.d/custom-system
+
+# Docker и MTProto
+docker ps
+docker logs --tail 50 mtproto-proxy
+```
+
 Автоматическая настройка свежих VPS-серверов с защитой от блокировки. 
 Скрипты настраивают SSH, файрвол, Docker и автоматические обновления.
 
