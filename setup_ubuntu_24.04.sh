@@ -358,24 +358,7 @@ if [ -f "/etc/security/limits.conf" ]; then
     cp /etc/security/limits.conf /etc/security/limits.conf.bak.$(date +%s)
 fi
 
-# Добавление ограничений в limits.conf (без дублирования)
-: <<'DISABLED_LIMITS_CONF'
-cat >> /etc/security/limits.conf << EOF
-
-# Hard limits для всех пользователей
-* hard nproc 500
-* hard nofile 65535
-* hard rss 500000
-
-# Hard limits для конкретного пользователя
-$NEW_USER soft nofile 65535
-$NEW_USER hard nofile 65535
-$NEW_USER soft nproc 4096
-$NEW_USER hard nproc 8192
-EOF
-DISABLED_LIMITS_CONF
-
-# Также добавляем в /etc/security/limits.d/ для лучшей совместимости
+# Используем отдельный файл в limits.d, чтобы не накапливать дубли в limits.conf
 mkdir -p /etc/security/limits.d
 cat > /etc/security/limits.d/99-custom.conf << EOF
 # Custom limits for $NEW_USER
@@ -392,7 +375,7 @@ $NEW_USER hard nproc 8192
 EOF
 
 log "Ограничения для пользователей настроены"
-add_check 0 "Ограничения для пользователей (limits.conf)"
+add_check 0 "Ограничения для пользователей (limits.d)"
 
 # 07. СОЗДАНИЕ ПОЛЬЗОВАТЕЛЯ ====================================================
 
@@ -865,9 +848,9 @@ systemctl start apt-daily-upgrade.timer || SYSTEMD_RESULT=$?
 # Проверяем результат установки пакетов и статус сервиса
 add_check $AUTO_UPDATE_INSTALL "Автоматические обновления"
 if systemctl is-enabled --quiet apt-daily.timer 2>/dev/null && systemctl is-enabled --quiet apt-daily-upgrade.timer 2>/dev/null; then
-    add_check 0 "Сервис unattended-upgrades активен"
+    add_check 0 "APT auto-update timers enabled"
 else
-    add_check 1 "Сервис unattended-upgrades активен"
+    add_check 1 "APT auto-update timers enabled"
 fi
 
 # 15. НАСТРОЙКА NEEDRESTART (АВТОМАТИЧЕСКИЙ ПЕРЕЗАПУСК СЕРВИСОВ) =============
