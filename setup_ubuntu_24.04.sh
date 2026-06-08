@@ -119,10 +119,14 @@ check_service() {
     return 0
 }
 
-file_contains() {
+authorized_keys_ed25519_only() {
     local file=$1
-    local pattern=$2
-    grep -qE "$pattern" "$file" 2>/dev/null
+    awk '
+        /^[[:space:]]*($|#)/ { next }
+        $1 == "ssh-ed25519" { found=1; next }
+        { invalid=1 }
+        END { exit !(found && !invalid) }
+    ' "$file" 2>/dev/null
 }
 
 # 01. ПРОВЕРКИ ПЕРЕД СТАРТОМ ====================================================
@@ -482,7 +486,7 @@ if curl -fsSL "$SSH_KEY_URL" -o "$SSH_DIR/authorized_keys"; then
     if [ "$(stat -c '%a' "$SSH_DIR/authorized_keys" 2>/dev/null)" != "600" ]; then
         SSH_KEY_VALIDATION_OK=1
     fi
-    if ! file_contains "$SSH_DIR/authorized_keys" '^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp256|ecdsa-sha2-nistp384|ecdsa-sha2-nistp521)[[:space:]]'; then
+    if ! authorized_keys_ed25519_only "$SSH_DIR/authorized_keys"; then
         SSH_KEY_VALIDATION_OK=1
     fi
     log "SSH ключ установлен"
@@ -519,8 +523,8 @@ if [ "$SSH_KEYS_READY" != true ] || [ ! -s "$SSH_DIR/authorized_keys" ]; then
     add_check 1 "SSH key setup"
     exit 1
 fi
-if ! grep -qE '^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp256|ecdsa-sha2-nistp384|ecdsa-sha2-nistp521)[[:space:]]' "$SSH_DIR/authorized_keys"; then
-    error "No valid SSH public keys found in authorized_keys. Stopping before SSH hardening."
+if ! authorized_keys_ed25519_only "$SSH_DIR/authorized_keys"; then
+    error "authorized_keys должен содержать только валидные ключи ssh-ed25519. Остановка до SSH hardening."
     add_check 1 "SSH key setup"
     exit 1
 fi
@@ -543,6 +547,7 @@ PasswordAuthentication no
 KbdInteractiveAuthentication no
 ChallengeResponseAuthentication no
 PubkeyAuthentication yes
+PubkeyAcceptedAlgorithms ssh-ed25519
 PermitRootLogin prohibit-password
 UsePAM yes
 MaxAuthTries 3
@@ -711,16 +716,15 @@ else
         has_valid_key=false
         while IFS= read -r line; do
             [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
-            if [[ "$line" =~ ^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp256|ecdsa-sha2-nistp384|ecdsa-sha2-nistp521) ]]; then
+            if [[ "$line" =~ ^ssh-ed25519[[:space:]] ]]; then
                 has_valid_key=true
-                log "Найден валидный SSH-ключ типа: ${BASH_REMATCH[1]}"
+                log "Найден валидный SSH-ключ типа ssh-ed25519"
                 break
             fi
         done < "$AUTH_KEYS"
         
-        if [ "$has_valid_key" = false ]; then
-            error "В authorized_keys не найдено валидных SSH-ключей"
-            log "Файл должен содержать ключи в форматах: ssh-ed25519, ssh-rsa, ecdsa-sha2-*, ssh-dss"
+        if [ "$has_valid_key" = false ] || ! authorized_keys_ed25519_only "$AUTH_KEYS"; then
+            error "authorized_keys должен содержать только валидные ключи ssh-ed25519"
             SSH_VALIDATION_PASSED=false
         fi
     fi
@@ -1237,6 +1241,9 @@ grep "^PasswordAuthentication no" /etc/ssh/sshd_config.d/99-custom.conf &>/dev/n
 
 echo -n "  PubkeyAuth:     "
 grep "^PubkeyAuthentication yes" /etc/ssh/sshd_config.d/99-custom.conf &>/dev/null && echo -e "${GREEN}enabled${NC}" || echo -e "${RED}FAIL${NC}"
+
+echo -n "  User key type:  "
+grep "^PubkeyAcceptedAlgorithms ssh-ed25519$" /etc/ssh/sshd_config.d/99-custom.conf &>/dev/null && echo -e "${GREEN}ssh-ed25519 only${NC}" || echo -e "${RED}FAIL${NC}"
 
 echo ""
 echo "Сетевые интерфейсы:"
