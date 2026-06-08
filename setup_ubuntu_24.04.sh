@@ -548,7 +548,7 @@ KbdInteractiveAuthentication no
 ChallengeResponseAuthentication no
 PubkeyAuthentication yes
 PubkeyAcceptedAlgorithms ssh-ed25519
-PermitRootLogin prohibit-password
+PermitRootLogin no
 UsePAM yes
 MaxAuthTries 3
 ClientAliveInterval 300
@@ -587,6 +587,18 @@ if ! sshd -t; then
         fi
         log "Бэкап SSH конфига восстановлен"
     fi
+    exit 1
+fi
+
+# Блокируем пароль root только после успешной проверки SSH-конфигурации.
+# Учётная запись root сохраняется и остаётся доступной через sudo -i или консоль провайдера.
+log "Блокировка прямого входа root..."
+if passwd -l root >/dev/null 2>&1 && passwd -S root 2>/dev/null | awk '{print $2}' | grep -q '^L'; then
+    log "Пароль root заблокирован, прямой SSH-вход root запрещён"
+    add_check 0 "Root login отключён и пароль root заблокирован"
+else
+    error "Не удалось подтвердить блокировку пароля root. Остановка до перезапуска SSH."
+    add_check 1 "Блокировка root"
     exit 1
 fi
 
@@ -1244,6 +1256,12 @@ grep "^PubkeyAuthentication yes" /etc/ssh/sshd_config.d/99-custom.conf &>/dev/nu
 
 echo -n "  User key type:  "
 grep "^PubkeyAcceptedAlgorithms ssh-ed25519$" /etc/ssh/sshd_config.d/99-custom.conf &>/dev/null && echo -e "${GREEN}ssh-ed25519 only${NC}" || echo -e "${RED}FAIL${NC}"
+
+echo -n "  Root SSH login: "
+grep "^PermitRootLogin no$" /etc/ssh/sshd_config.d/99-custom.conf &>/dev/null && echo -e "${GREEN}disabled${NC}" || echo -e "${RED}FAIL${NC}"
+
+echo -n "  Root password:  "
+passwd -S root 2>/dev/null | awk '{print $2}' | grep -q '^L' && echo -e "${GREEN}locked${NC}" || echo -e "${RED}FAIL${NC}"
 
 echo ""
 echo "Сетевые интерфейсы:"
