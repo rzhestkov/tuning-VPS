@@ -44,7 +44,7 @@ error() {
 # Функция проверки существования UFW правила
 ufw_rule_exists() {
     local port=$1
-    ufw status | grep -q "$port"
+    ufw status | awk '{print $1}' | grep -qx "$port"
     return $?
 }
 
@@ -497,6 +497,14 @@ fi
 log "Настройка SSH сервера..."
 log "${YELLOW}>>> ВАЖНО: Не закрывайте это окно до проверки подключения! <<<${NC}"
 
+# На свежем сервере сохраняем порт 22 до ручной проверки нового подключения.
+# При повторном запуске уже закрытый порт 22 повторно не открываем.
+KEEP_LEGACY_SSH_PORT=false
+if ss -tlnp 2>/dev/null | grep -qE '(:22\s|\.22\s)'; then
+    KEEP_LEGACY_SSH_PORT=true
+    log "Порт 22 временно останется доступен до проверки подключения на порту $SSH_PORT"
+fi
+
 # Бэкап конфигов с сохранением имени файла для возможного восстановления
 SSHD_BACKUP_FILE="/etc/ssh/sshd_config.bak.$(date +%s)"
 CUSTOM_SSHD_CONFIG="/etc/ssh/sshd_config.d/99-custom.conf"
@@ -550,6 +558,14 @@ PermitEmptyPasswords no
 # Hardening алгоритмов шифрования (защита от Terrapin CVE-2023-48795)
 # Убрали chacha20-poly1305@openssh.com для полного соответствия строгому режиму
 EOF
+
+if [ "$KEEP_LEGACY_SSH_PORT" = true ]; then
+    {
+        echo ""
+        echo "# Временный порт до ручной проверки подключения"
+        echo "Port 22"
+    } >> "$CUSTOM_SSHD_CONFIG"
+fi
 
 # 09.3 Проверка конфигурации
 # Создаем необходимую директорию для проверки конфига
@@ -610,6 +626,11 @@ if ! ufw_rule_exists "$SSH_PORT/tcp"; then
     ufw allow "$SSH_PORT/tcp" comment 'SSH Custom Port'
 fi
 
+# Сохраняем доступ через старый порт до ручной проверки нового подключения.
+if [ "$KEEP_LEGACY_SSH_PORT" = true ] && ! ufw_rule_exists "22/tcp"; then
+    ufw allow 22/tcp comment 'SSH Temporary Legacy Port'
+fi
+
 # Разрешаем веб-порты
 if ! ufw_rule_exists "80/tcp"; then
     ufw allow 80/tcp comment 'HTTP'
@@ -642,17 +663,8 @@ fi
 
 # 11. ЗАКРЫТИЕ СТАРОГО SSH ПОРТА (ФИНАЛЬНЫЙ ЭТАП) =============================
 
-# Проверка, закрыт ли порт 22 (в UFW и не слушает ли сокет)
-port_22_ufw_closed=false
-port_22_socket_closed=false
-if ! ufw status | grep -q "22/tcp"; then
-    port_22_ufw_closed=true
-fi
-if ! ss -tlnp 2>/dev/null | grep -qE '(:22\s|\.22\s)'; then
-    port_22_socket_closed=true
-fi
-
-if $port_22_ufw_closed && $port_22_socket_closed; then
+# Если порт 22 был закрыт до запуска, повторно его не открываем и вопрос не задаём.
+if [ "$KEEP_LEGACY_SSH_PORT" != true ]; then
     log "Порт 22 уже закрыт, пропускаем"
     add_check 0 "Закрытие порта 22 (уже закрыт)"
 else
@@ -683,8 +695,18 @@ else
         log "Проверьте: sudo ss -tlnp | grep ssh"
         SSH_VALIDATION_PASSED=false
     fi
+
+    # Проверка 4: старый порт действительно сохранён до ручного подтверждения
+    if [ "$SSH_VALIDATION_PASSED" = true ] && ! ss -tlnp 2>/dev/null | grep -qE '(:22\s|\.22\s)'; then
+        error "Порт 22 перестал слушаться до ручной проверки нового подключения"
+        SSH_VALIDATION_PASSED=false
+    fi
+    if [ "$SSH_VALIDATION_PASSED" = true ] && ! ufw_rule_exists "22/tcp"; then
+        error "В UFW отсутствует временное правило для порта 22"
+        SSH_VALIDATION_PASSED=false
+    fi
     
-    # Проверка 4: содержимое authorized_keys валидно
+    # Проверка 5: содержимое authorized_keys валидно
     if [ "$SSH_VALIDATION_PASSED" = true ]; then
         has_valid_key=false
         while IFS= read -r line; do
@@ -724,12 +746,29 @@ else
         read -p "Подключение работает? Закрыть порт 22? (yes/no): " confirm
 
         if [ "$confirm" = "yes" ]; then
-            ufw delete allow 22/tcp 2>/dev/null || true
-            log "Порт 22 закрыт"
-            add_check 0 "Закрытие порта 22"
+            sed -i '/^# Временный порт до ручной проверки подключения$/d; /^Port 22$/d' "$CUSTOM_SSHD_CONFIG"
+            if sshd -t && systemctl restart ssh; then
+                ufw delete allow 22/tcp 2>/dev/null || true
+                if ! ss -tlnp 2>/dev/null | grep -qE '(:22\s|\.22\s)'; then
+                    log "Порт 22 закрыт"
+                    add_check 0 "Закрытие порта 22"
+                else
+                    error "SSH продолжает слушать порт 22. Проверьте конфигурацию вручную."
+                    add_check 1 "Закрытие порта 22"
+                fi
+            else
+                error "Не удалось применить закрытие порта 22. Восстанавливаю временный доступ."
+                {
+                    echo ""
+                    echo "# Временный порт до ручной проверки подключения"
+                    echo "Port 22"
+                } >> "$CUSTOM_SSHD_CONFIG"
+                systemctl restart ssh 2>/dev/null || true
+                add_check 1 "Закрытие порта 22"
+            fi
         else
             warn "Порт 22 оставлен открытым! Закройте его вручную позже:"
-            warn "sudo ufw delete allow 22/tcp"
+            warn "Удалите строку 'Port 22' из $CUSTOM_SSHD_CONFIG, перезапустите SSH и удалите правило UFW."
             add_check 1 "Закрытие порта 22 (отложено)"
         fi
     fi
@@ -1344,76 +1383,110 @@ elif command -v docker &>/dev/null; then
 fi
 if [ "$DOCKER_AVAILABLE" = true ]; then
     echo ""
-    read -p "Установить MTProto Proxy для Telegram? (y/N): " install_mtproto
-    
-    if [ "$install_mtproto" = "y" ] || [ "$install_mtproto" = "Y" ]; then
-        log "Настройка MTProto Proxy..."
-        
-        # Запрашиваем домен для маскировки
-        read -p "Введите домен для маскировки трафика [по умолчанию: www.cloudflare.com]: " domain
-        domain=${domain:-www.cloudflare.com}
-        
-        log "Генерация секретного ключа (домен: $domain)..."
-        SECRET=$(docker run --rm nineseconds/mtg:2 generate-secret --hex "$domain" 2>/dev/null | tr -d '\r\n')
-        
-        if [ -z "$SECRET" ]; then
-            error "Не удалось сгенерировать секрет. Пробуем еще раз..."
-            SECRET=$(docker run --rm nineseconds/mtg:2 generate-secret --hex "$domain" 2>/dev/null | tr -d '\r\n')
+    MTPROTO_IMPLEMENTATION=""
+    read -p "Установить MTProto от 9seconds [9seconds/mtg](https://github.com/9seconds/mtg)? (y/N): " install_mtg
+
+    if [ "$install_mtg" = "y" ] || [ "$install_mtg" = "Y" ]; then
+        MTPROTO_IMPLEMENTATION="9seconds/mtg"
+    else
+        read -p "Установить MTProto от seriyps [seriyps/mtproto_proxy](https://github.com/seriyps/mtproto_proxy)? (y/N): " install_seriyps
+        if [ "$install_seriyps" = "y" ] || [ "$install_seriyps" = "Y" ]; then
+            MTPROTO_IMPLEMENTATION="seriyps/mtproto_proxy"
         fi
-        
+    fi
+
+    if [ -n "$MTPROTO_IMPLEMENTATION" ]; then
+        log "Настройка MTProto Proxy ($MTPROTO_IMPLEMENTATION)..."
+
+        # SNI должен выглядеть правдоподобно для страны, в которой расположен сервер.
+        while true; do
+            read -p "Какой SNI использовать для маскировки? Укажите HTTPS-домен, соответствующий стране сервера: " domain
+            domain=$(echo "$domain" | tr '[:upper:]' '[:lower:]' | xargs)
+            if [[ "$domain" =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$ ]]; then
+                break
+            fi
+            warn "Введите только доменное имя без https://, порта и пути (например: www.example.de)."
+        done
+
+        if [ "$MTPROTO_IMPLEMENTATION" = "9seconds/mtg" ]; then
+            log "Генерация секретного ключа 9seconds/mtg (SNI: $domain)..."
+            SECRET=$(docker run --rm nineseconds/mtg:2 generate-secret --hex "$domain" 2>/dev/null | tr -d '\r\n')
+
+            if [ -z "$SECRET" ]; then
+                error "Не удалось сгенерировать секрет. Пробуем еще раз..."
+                SECRET=$(docker run --rm nineseconds/mtg:2 generate-secret --hex "$domain" 2>/dev/null | tr -d '\r\n')
+            fi
+        else
+            log "Генерация секретного ключа seriyps/mtproto_proxy (SNI: $domain)..."
+            BASE_SECRET=$(openssl rand -hex 16 2>/dev/null)
+            DOMAIN_HEX=$(printf '%s' "$domain" | od -An -tx1 | tr -d ' \n')
+            MTPROTO_TAG="00000000000000000000000000000000"
+            if [[ "$BASE_SECRET" =~ ^[a-f0-9]{32}$ ]] && [ -n "$DOMAIN_HEX" ]; then
+                SECRET="ee${BASE_SECRET}${DOMAIN_HEX}"
+            else
+                SECRET=""
+            fi
+        fi
+
         if [ -n "$SECRET" ]; then
             log "Секрет сгенерирован: $SECRET"
-            
-            # Сохраняем секрет в файл для финального отчёта
+
+            # Сохраняем секрет и реализацию для финального отчёта.
             echo "$SECRET" > /tmp/mtproto_secret.txt
-            
-            # Останавливаем и удаляем старый контейнер если есть
+            echo "$MTPROTO_IMPLEMENTATION" > /tmp/mtproto_implementation.txt
+
+            # Единое имя контейнера и порт исключают одновременную работу двух реализаций.
             docker stop mtproto-proxy &>/dev/null || true
             docker rm mtproto-proxy &>/dev/null || true
-            
-            # Запускаем контейнер
-            log "Запуск MTProto Proxy на порту 443..."
-            docker run -d \
-              --name mtproto-proxy \
-              --restart unless-stopped \
-              -p 443:443 \
-              nineseconds/mtg:2 \
-              simple-run -n 1.1.1.1 -i prefer-ipv4 0.0.0.0:443 "$SECRET"
-            
+
+            log "Запуск MTProto Proxy ($MTPROTO_IMPLEMENTATION) на порту 443..."
+            if [ "$MTPROTO_IMPLEMENTATION" = "9seconds/mtg" ]; then
+                docker run -d \
+                  --name mtproto-proxy \
+                  --restart unless-stopped \
+                  -p 443:443 \
+                  nineseconds/mtg:2 \
+                  simple-run -n 1.1.1.1 -i prefer-ipv4 0.0.0.0:443 "$SECRET"
+            else
+                docker run -d \
+                  --name mtproto-proxy \
+                  --restart unless-stopped \
+                  --network host \
+                  seriyps/mtproto-proxy:latest \
+                  -p 443 -s "$BASE_SECRET" -t "$MTPROTO_TAG" -a tls
+            fi
+
             sleep 3
-            
-# Проверяем, что контейнер запущен
-if docker ps | grep -q mtproto-proxy; then
-    log "MTProto Proxy успешно запущен!"
-    
-    echo ""
-    echo "===MTPROTO PROXY НАСТРОЕН==="
-    echo ""
-    echo "  Сервер: $SERVER_IP"
-    echo "  Порт: 443"
-    echo "  Секрет: $SECRET"
-    echo "  Домен маскировки: $domain"
-    echo ""
-    echo "  Ссылка для подключения:"
-    echo "  tg://proxy?server=$SERVER_IP&port=443&secret=$SECRET"
-    echo ""
-    echo "  Ссылка (для копирования):"
-    echo -e "${YELLOW}tg://proxy?server=$SERVER_IP&port=443&secret=$SECRET${NC}"
-    echo ""
-    echo "  Проверка логов: docker logs -f mtproto-proxy"
-    echo "  Остановка: docker stop mtproto-proxy"
-    echo "  Удаление: docker rm -f mtproto-proxy"
-    echo ""
-    
-    # Добавляем в массив проверок
-    CHECKS+=("${GREEN}[OK]${NC} MTProto Proxy (порт 443)")
-else
-    error "Контейнер MTProto не запустился. Проверьте логи: docker logs mtproto-proxy"
-    CHECKS+=("${RED}[FAIL]${NC} MTProto Proxy (ошибка запуска)")
-fi
+
+            # Проверяем, что контейнер запущен.
+            if docker ps --format '{{.Names}}' | grep -qx mtproto-proxy; then
+                log "MTProto Proxy успешно запущен!"
+
+                echo ""
+                echo "===MTPROTO PROXY НАСТРОЕН==="
+                echo ""
+                echo "  Реализация: $MTPROTO_IMPLEMENTATION"
+                echo "  Сервер: $SERVER_IP"
+                echo "  Порт: 443"
+                echo "  Секрет: $SECRET"
+                echo "  SNI маскировки: $domain"
+                echo ""
+                echo "  Ссылка для подключения:"
+                echo -e "${YELLOW}tg://proxy?server=$SERVER_IP&port=443&secret=$SECRET${NC}"
+                echo ""
+                echo "  Проверка логов: docker logs -f mtproto-proxy"
+                echo "  Остановка: docker stop mtproto-proxy"
+                echo "  Удаление: docker rm -f mtproto-proxy"
+                echo ""
+
+                CHECKS+=("${GREEN}[OK]${NC} MTProto Proxy $MTPROTO_IMPLEMENTATION (порт 443)")
+            else
+                error "Контейнер MTProto не запустился. Проверьте логи: docker logs mtproto-proxy"
+                CHECKS+=("${RED}[FAIL]${NC} MTProto Proxy $MTPROTO_IMPLEMENTATION (ошибка запуска)")
+            fi
         else
             error "Не удалось сгенерировать секретный ключ"
-            CHECKS+=("${RED}[FAIL]${NC} MTProto Proxy (ошибка генерации секрета)")
+            CHECKS+=("${RED}[FAIL]${NC} MTProto Proxy $MTPROTO_IMPLEMENTATION (ошибка генерации секрета)")
         fi
     else
         log "Установка MTProto Proxy пропущена"
@@ -1450,6 +1523,9 @@ if docker ps | grep -q mtproto-proxy 2>/dev/null; then
     echo "MTProto Proxy активен:"
     echo "----------------------"
     echo -e "  Статус: ${GREEN}запущен${NC}"
+    if [ -f /tmp/mtproto_implementation.txt ]; then
+        echo "  Реализация: $(cat /tmp/mtproto_implementation.txt)"
+    fi
     echo "  Порт: 443"
     echo "  IP: $SERVER_IP"
     if [ -n "$MTPROTO_SECRET" ]; then
