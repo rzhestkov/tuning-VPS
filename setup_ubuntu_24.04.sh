@@ -24,8 +24,10 @@ NC='\033[0m' # No Color
 # Массив для результатов диагностики
 declare -a CHECKS
 
-# Переменная для проверки установки Docker (объявляем в начале для проблемы 8)
-DOCKER_INSTALLED=false
+# Состояния опциональных компонентов
+DOCKER_STATE="not-installed"
+MTPROTO_STATE="not-requested"
+MTPROTO_IMPLEMENTATION=""
 SSH_KEYS_READY=false
 
 # Функция логирования
@@ -48,14 +50,65 @@ ufw_rule_exists() {
     return $?
 }
 
-# Функция добавления результата проверки
+# Функции добавления результатов проверки
+add_result() {
+    local status=$1
+    local component=$2
+    local detail=$3
+    local color=$NC
+
+    case "$status" in
+        OK) color=$GREEN ;;
+        WARN|SKIP) color=$YELLOW ;;
+        FAIL) color=$RED ;;
+    esac
+
+    CHECKS+=("${color}[$status]${NC} $component: $detail")
+}
+
+# Совместимость с ранее реализованными блоками.
 add_check() {
     local status=$1
     local message=$2
-    if [ $status -eq 0 ]; then
-        CHECKS+=("${GREEN}[OK]${NC} $message")
+    if [ "$status" -eq 0 ]; then
+        add_result "OK" "$message" "проверка пройдена"
     else
-        CHECKS+=("${RED}[FAIL]${NC} $message")
+        add_result "FAIL" "$message" "проверка не пройдена"
+    fi
+}
+
+replace_managed_section() {
+    local file=$1
+    local section=$2
+    local content_file=$3
+    local begin="# BEGIN tuning-VPS managed section: $section"
+    local end="# END tuning-VPS managed section: $section"
+    local temp_file
+
+    temp_file=$(mktemp)
+    awk -v begin="$begin" -v end="$end" '
+        $0 == begin { managed=1; next }
+        $0 == end { managed=0; next }
+        !managed { print }
+    ' "$file" > "$temp_file"
+
+    {
+        cat "$temp_file"
+        echo ""
+        echo "$begin"
+        cat "$content_file"
+        echo "$end"
+    } > "$file"
+    rm -f "$temp_file"
+}
+
+detect_docker_state() {
+    if ! command -v docker &>/dev/null; then
+        DOCKER_STATE="not-installed"
+    elif docker info &>/dev/null; then
+        DOCKER_STATE="installed-running"
+    else
+        DOCKER_STATE="installed-stopped"
     fi
 }
 
@@ -127,6 +180,12 @@ authorized_keys_ed25519_only() {
         { invalid=1 }
         END { exit !(found && !invalid) }
     ' "$file" 2>/dev/null
+}
+
+file_contains() {
+    local file=$1
+    local pattern=$2
+    grep -qE "$pattern" "$file" 2>/dev/null
 }
 
 # 01. ПРОВЕРКИ ПЕРЕД СТАРТОМ ====================================================
@@ -366,43 +425,7 @@ else
     add_check 1 "Hardening ядра (sysctl)"
 fi
 
-# 06. ОГРАНИЧЕНИЯ ДЛЯ ПОЛЬЗОВАТЕЛЯ (LIMITS.CONF) ==============================
-
-log "Настройка ограничений для пользователей..."
-
-# Бэкап оригинального конфига
-if [ -f "/etc/security/limits.conf" ]; then
-    cp /etc/security/limits.conf /etc/security/limits.conf.bak.$(date +%s)
-fi
-
-# Используем отдельный файл в limits.d, чтобы не накапливать дубли в limits.conf
-mkdir -p /etc/security/limits.d
-cat > /etc/security/limits.d/99-custom.conf << EOF
-# Custom limits for $NEW_USER
-$NEW_USER soft nofile 65535
-$NEW_USER hard nofile 65535
-$NEW_USER soft nproc 4096
-$NEW_USER hard nproc 8192
-
-# Global limits
-* soft nofile 65535
-* hard nofile 65535
-* soft nproc 8192
-* hard nproc 16384
-EOF
-
-log "Ограничения для пользователей настроены"
-LIMITS_VALIDATION_OK=0
-if [ -f "/etc/security/limits.d/99-custom.conf" ] && \
-   file_contains "/etc/security/limits.d/99-custom.conf" "^$NEW_USER hard nofile 65535$" && \
-   file_contains "/etc/security/limits.d/99-custom.conf" "^$NEW_USER hard nproc 8192$"; then
-    LIMITS_VALIDATION_OK=0
-else
-    LIMITS_VALIDATION_OK=1
-fi
-add_check $LIMITS_VALIDATION_OK "Ограничения для пользователей (limits.d)"
-
-# 07. СОЗДАНИЕ ПОЛЬЗОВАТЕЛЯ ====================================================
+# 06. СОЗДАНИЕ ПОЛЬЗОВАТЕЛЯ ====================================================
 
 log "Создание пользователя $NEW_USER..."
 
@@ -456,6 +479,54 @@ if [ -f "/etc/sudoers.d/99-$NEW_USER" ] && ! visudo -c -f /etc/sudoers.d/99-$NEW
 fi
 add_check $USER_VALIDATION_OK "Пользователь $NEW_USER и sudo"
 
+# 07. ОГРАНИЧЕНИЯ ДЛЯ ПОЛЬЗОВАТЕЛЯ (LIMITS.CONF) ==============================
+
+log "Настройка и фактическая проверка ограничений пользователя..."
+
+LIMITS_CONFIG="/etc/security/limits.conf"
+LIMITS_BACKUP="${LIMITS_CONFIG}.bak.$(date +%s)"
+LIMITS_SECTION=$(mktemp)
+LIMITS_CONFIG_EXISTED=false
+if [ -f "$LIMITS_CONFIG" ]; then
+    LIMITS_CONFIG_EXISTED=true
+    cp "$LIMITS_CONFIG" "$LIMITS_BACKUP"
+else
+    install -m 0644 /dev/null "$LIMITS_CONFIG"
+fi
+
+cat > "$LIMITS_SECTION" << EOF
+# Ограничения применяются только к управляемому пользователю.
+$NEW_USER soft nofile 65535
+$NEW_USER hard nofile 65535
+$NEW_USER soft nproc 4096
+$NEW_USER hard nproc 8192
+EOF
+
+replace_managed_section "$LIMITS_CONFIG" "user-limits" "$LIMITS_SECTION"
+rm -f "$LIMITS_SECTION"
+
+LIMITS_FAILURE=""
+if ! grep -RqsE '^[[:space:]]*session[[:space:]]+required[[:space:]]+pam_limits\.so' /etc/pam.d/sshd /etc/pam.d/login; then
+    LIMITS_FAILURE="pam_limits.so не подключён для SSH/login-сессий"
+else
+    USER_NOFILE=$(su - "$NEW_USER" -c 'ulimit -n' 2>/dev/null || true)
+    USER_NPROC=$(su - "$NEW_USER" -c 'ulimit -u' 2>/dev/null || true)
+    if [ "$USER_NOFILE" != "65535" ] || [ "$USER_NPROC" != "4096" ]; then
+        LIMITS_FAILURE="реальные лимиты user=$NEW_USER: nofile=${USER_NOFILE:-unknown}, nproc=${USER_NPROC:-unknown}"
+    fi
+fi
+
+if [ -z "$LIMITS_FAILURE" ]; then
+    add_result "OK" "Limits" "для $NEW_USER применены nofile=65535 и nproc=4096"
+else
+    if [ "$LIMITS_CONFIG_EXISTED" = true ]; then
+        cp "$LIMITS_BACKUP" "$LIMITS_CONFIG"
+    else
+        rm -f "$LIMITS_CONFIG"
+    fi
+    add_result "FAIL" "Limits" "$LIMITS_FAILURE; исходный limits.conf восстановлен"
+fi
+
 # 08. НАСТРОЙКА SSH КЛЮЧЕЙ =====================================================
 
 log "Настройка SSH ключей..."
@@ -496,134 +567,309 @@ else
     add_check 1 "Установка SSH ключа"
 fi
 
-# 09. НАСТРОЙКА SSH (С ЗАЩИТОЙ ОТ БЛОКИРОВКИ) ==================================
+# 09. НАСТРОЙКА SSH (ЕДИНЫЙ ОСНОВНОЙ КОНФИГ + ОТКАТ) ===========================
 
-log "Настройка SSH сервера..."
-log "${YELLOW}>>> ВАЖНО: Не закрывайте это окно до проверки подключения! <<<${NC}"
+log "Предварительная диагностика SSH..."
+log "${YELLOW}>>> ВАЖНО: Не закрывайте текущую root-сессию до контрольного входа! <<<${NC}"
 
-# На свежем сервере сохраняем порт 22 до ручной проверки нового подключения.
-# При повторном запуске уже закрытый порт 22 повторно не открываем.
-KEEP_LEGACY_SSH_PORT=false
-if ss -tlnp 2>/dev/null | grep -qE '(:22\s|\.22\s)'; then
-    KEEP_LEGACY_SSH_PORT=true
-    log "Порт 22 временно останется доступен до проверки подключения на порту $SSH_PORT"
+SSHD_CONFIG="/etc/ssh/sshd_config"
+SSHD_BACKUP_FILE="${SSHD_CONFIG}.bak.$(date +%s)"
+SSH_SAFE_INCLUDES_FILE=$(mktemp)
+SSH_DISABLED_INCLUDES_FILE=$(mktemp)
+ROOT_PASSWORD_WAS_LOCKED=false
+ROOT_PASSWORD_HASH_BEFORE=$(getent shadow root | cut -d: -f2)
+SSH_SOCKET_WAS_ACTIVE=$(systemctl is-active ssh.socket 2>/dev/null || true)
+SSH_SOCKET_WAS_ENABLED=$(systemctl is-enabled ssh.socket 2>/dev/null || true)
+trap 'rm -f "$SSH_SAFE_INCLUDES_FILE" "$SSH_DISABLED_INCLUDES_FILE"' EXIT
+
+if passwd -S root 2>/dev/null | awk '{print $2}' | grep -q '^L'; then
+    ROOT_PASSWORD_WAS_LOCKED=true
 fi
 
-# Бэкап конфигов с сохранением имени файла для возможного восстановления
-SSHD_BACKUP_FILE="/etc/ssh/sshd_config.bak.$(date +%s)"
-CUSTOM_SSHD_CONFIG="/etc/ssh/sshd_config.d/99-custom.conf"
-CUSTOM_SSHD_BACKUP_FILE=""
-if [ -f "$CUSTOM_SSHD_CONFIG" ]; then
-    CUSTOM_SSHD_BACKUP_FILE="${CUSTOM_SSHD_CONFIG}.bak.$(date +%s)"
-    cp "$CUSTOM_SSHD_CONFIG" "$CUSTOM_SSHD_BACKUP_FILE"
-fi
-cp /etc/ssh/sshd_config "$SSHD_BACKUP_FILE"
-if [ "$SSH_KEYS_READY" != true ] || [ ! -s "$SSH_DIR/authorized_keys" ]; then
-    error "SSH keys are missing or invalid. Stopping before SSH hardening."
-    add_check 1 "SSH key setup"
-    exit 1
-fi
-if ! authorized_keys_ed25519_only "$SSH_DIR/authorized_keys"; then
-    error "authorized_keys должен содержать только валидные ключи ssh-ed25519. Остановка до SSH hardening."
-    add_check 1 "SSH key setup"
-    exit 1
-fi
+ssh_port_listening() {
+    local port=$1
+    ss -tlnp 2>/dev/null | grep -qE ":${port}([[:space:]]|$)"
+}
 
-# 09.1 Отключаем cloud-init конфиг (проблема VDSina)
-if [ -f "/etc/ssh/sshd_config.d/50-cloud-init.conf" ]; then
-    cp /etc/ssh/sshd_config.d/50-cloud-init.conf /etc/ssh/sshd_config.d/50-cloud-init.conf.bak.$(date +%s)
-    log "Отключение cloud-init настроек SSH..."
-    sed -i 's/^PasswordAuthentication yes/# PasswordAuthentication yes/' /etc/ssh/sshd_config.d/50-cloud-init.conf
-    sed -i 's/^PermitRootLogin yes/# PermitRootLogin yes/' /etc/ssh/sshd_config.d/50-cloud-init.conf
-fi
+ssh_effective_has() {
+    local expected=$1
+    sshd -T 2>/dev/null | grep -qx "$expected"
+}
 
-# 09.2 Основной конфиг SSH
-log "Изменение порта SSH на $SSH_PORT..."
+ssh_include_has_conflict() {
+    local include_file=$1
+    local depth=${2:-0}
+    local line trimmed pattern nested_file nested_pattern_matched
 
-cat > /etc/ssh/sshd_config.d/99-custom.conf << EOF
-# Кастомные настройки
-Port $SSH_PORT
-PasswordAuthentication no
-KbdInteractiveAuthentication no
-ChallengeResponseAuthentication no
-PubkeyAuthentication yes
-PubkeyAcceptedAlgorithms ssh-ed25519
-PermitRootLogin no
-UsePAM yes
-MaxAuthTries 3
-ClientAliveInterval 300
-ClientAliveCountMax 2
-LoginGraceTime 30
-X11Forwarding no
-AllowAgentForwarding no
-PermitEmptyPasswords no
+    [ "$depth" -ge 8 ] && return 0
+    [ -f "$include_file" ] || return 1
 
-# Безопасные хост-ключи (удалили ssh-rsa из-за SHA-1, оставили только современные)
+    if grep -qiE '^[[:space:]]*(Port|ListenAddress|PasswordAuthentication|KbdInteractiveAuthentication|ChallengeResponseAuthentication|PubkeyAuthentication|PubkeyAcceptedAlgorithms|PermitRootLogin|UsePAM|MaxAuthTries|ClientAliveInterval|ClientAliveCountMax|LoginGraceTime|X11Forwarding|AllowAgentForwarding|AllowTcpForwarding|DisableForwarding|GatewayPorts|PermitOpen|PermitListen|PermitTTY|PermitEmptyPasswords|AuthorizedKeysFile|AuthorizedKeysCommand|AuthorizedKeysCommandUser|AuthenticationMethods|AllowUsers|DenyUsers|AllowGroups|DenyGroups|ForceCommand|ChrootDirectory|PrintMotd|Subsystem|Match)([[:space:]]|=)' "$include_file"; then
+        return 0
+    fi
 
-# Hardening алгоритмов шифрования (защита от Terrapin CVE-2023-48795)
-# Убрали chacha20-poly1305@openssh.com для полного соответствия строгому режиму
-EOF
+    while IFS= read -r line; do
+        trimmed="${line#"${line%%[![:space:]]*}"}"
+        [[ "${trimmed,,}" =~ ^include[[:space:]]+ ]] || continue
+        trimmed="${trimmed%%#*}"
+        for pattern in ${trimmed#* }; do
+            nested_pattern_matched=false
+            [[ "$pattern" = /* ]] || pattern="/etc/ssh/$pattern"
+            while IFS= read -r nested_file; do
+                nested_pattern_matched=true
+                if ssh_include_has_conflict "$nested_file" $((depth + 1)); then
+                    return 0
+                fi
+            done < <(compgen -G "$pattern" 2>/dev/null || true)
+            [ "$nested_pattern_matched" = true ] || return 0
+        done
+    done < "$include_file"
 
-if [ "$KEEP_LEGACY_SSH_PORT" = true ]; then
+    return 1
+}
+
+restore_ssh_access() {
+    warn "Восстановление исходной SSH-конфигурации и аварийного доступа на порту 22..."
+    cp "$SSHD_BACKUP_FILE" "$SSHD_CONFIG"
+
+    if [ -n "$ROOT_PASSWORD_HASH_BEFORE" ]; then
+        printf 'root:%s\n' "$ROOT_PASSWORD_HASH_BEFORE" | chpasswd -e >/dev/null 2>&1 || true
+    elif [ "$ROOT_PASSWORD_WAS_LOCKED" != true ]; then
+        passwd -u root >/dev/null 2>&1 || true
+    fi
+
+    if command -v ufw >/dev/null 2>&1; then
+        ufw allow 22/tcp comment 'SSH Recovery Port' >/dev/null 2>&1 || true
+    fi
+
+    systemctl stop ssh.service 2>/dev/null || true
+    if [ "$SSH_SOCKET_WAS_ACTIVE" = "active" ]; then
+        if [ "$SSH_SOCKET_WAS_ENABLED" = "enabled" ]; then
+            systemctl enable ssh.socket >/dev/null 2>&1 || true
+        fi
+        systemctl start ssh.socket 2>/dev/null || true
+        systemctl start ssh.service 2>/dev/null || true
+    else
+        systemctl stop ssh.socket 2>/dev/null || true
+        systemctl disable ssh.socket 2>/dev/null || true
+        systemctl enable ssh.service >/dev/null 2>&1 || true
+        sshd -t && systemctl restart ssh
+    fi
+
+    if sshd -t; then
+        sleep 2
+        if ssh_port_listening 22; then
+            warn "Исходная конфигурация восстановлена, SSH снова слушает порт 22."
+            return 0
+        fi
+    fi
+
+    error "Не удалось автоматически подтвердить восстановление порта 22. Не закрывайте текущую сессию!"
+    return 1
+}
+
+write_managed_sshd_config() {
+    local permit_root=$1
+    local keep_port_22=$2
+    local new_config="${SSHD_CONFIG}.new"
+
     {
+        echo "# Managed by setup_ubuntu_24.04.sh"
+        echo "# Основная поддерживаемая конфигурация SSH. Провайдерские Include ниже проверены."
         echo ""
-        echo "# Временный порт до ручной проверки подключения"
-        echo "Port 22"
-    } >> "$CUSTOM_SSHD_CONFIG"
+        echo "Port $SSH_PORT"
+        if [ "$keep_port_22" = true ]; then
+            echo "# Временный порт до ручной проверки подключения"
+            echo "Port 22"
+        fi
+        echo ""
+        echo "PasswordAuthentication no"
+        echo "KbdInteractiveAuthentication no"
+        echo "ChallengeResponseAuthentication no"
+        echo "PubkeyAuthentication yes"
+        echo "AuthorizedKeysFile .ssh/authorized_keys"
+        echo "PubkeyAcceptedAlgorithms ssh-ed25519"
+        echo "PermitRootLogin $permit_root"
+        echo "UsePAM yes"
+        echo "MaxAuthTries 3"
+        echo "ClientAliveInterval 300"
+        echo "ClientAliveCountMax 2"
+        echo "LoginGraceTime 30"
+        echo "X11Forwarding no"
+        echo "AllowAgentForwarding no"
+        echo "PermitEmptyPasswords no"
+        echo "PrintMotd no"
+        echo "Subsystem sftp internal-sftp"
+
+        if [ -s "$SSH_SAFE_INCLUDES_FILE" ]; then
+            echo ""
+            echo "# Проверенные провайдерские дополнения без конфликтующих SSH-директив"
+            cat "$SSH_SAFE_INCLUDES_FILE"
+        fi
+        if [ -s "$SSH_DISABLED_INCLUDES_FILE" ]; then
+            echo ""
+            cat "$SSH_DISABLED_INCLUDES_FILE"
+        fi
+    } > "$new_config"
+
+    chmod 600 "$new_config"
+    mv "$new_config" "$SSHD_CONFIG"
+}
+
+validate_managed_ssh_effective() {
+    local permit_root=$1
+    local keep_port_22=$2
+    local expected
+    local -a expected_settings=(
+        "passwordauthentication no"
+        "kbdinteractiveauthentication no"
+        "pubkeyauthentication yes"
+        "authorizedkeysfile .ssh/authorized_keys"
+        "pubkeyacceptedalgorithms ssh-ed25519"
+        "permitrootlogin $permit_root"
+        "usepam yes"
+        "maxauthtries 3"
+        "clientaliveinterval 300"
+        "clientalivecountmax 2"
+        "logingracetime 30"
+        "x11forwarding no"
+        "allowagentforwarding no"
+        "permitemptypasswords no"
+        "printmotd no"
+        "subsystem sftp internal-sftp"
+    )
+
+    ssh_effective_has "port $SSH_PORT" || return 1
+    if [ "$keep_port_22" = true ]; then
+        ssh_effective_has "port 22" || return 1
+    elif ssh_effective_has "port 22"; then
+        return 1
+    fi
+
+    for expected in "${expected_settings[@]}"; do
+        ssh_effective_has "$expected" || return 1
+    done
+}
+
+if ! ssh_port_listening 22; then
+    error "SSH не слушает ожидаемый исходный порт 22. Остановка до изменения конфигурации."
+    exit 1
+fi
+log "Исходный SSH-порт 22 слушается."
+log "Другие активные SSH-порты: $(ss -tlnp 2>/dev/null | awk '/sshd/ {print $4}' | sed 's/.*://' | sort -nu | grep -vx 22 | tr '\n' ' ' || true)"
+
+if [ -n "${SSH_CONNECTION:-}" ]; then
+    CURRENT_SSH_PORT=$(awk '{print $4}' <<< "$SSH_CONNECTION")
+    if [ "$CURRENT_SSH_PORT" != "22" ]; then
+        error "Текущая SSH-сессия подключена не к порту 22, а к порту $CURRENT_SSH_PORT."
+        error "Остановка до изменения конфигурации."
+        exit 1
+    fi
+    log "Подтверждено: текущая SSH-сессия использует порт 22."
+else
+    error "Не удалось подтвердить порт текущей сессии: переменная SSH_CONNECTION отсутствует."
+    error "Запустите скрипт из root SSH-сессии на порту 22."
+    exit 1
 fi
 
-# 09.3 Проверка конфигурации
-# Создаем необходимую директорию для проверки конфига
+log "Активные Include в основном конфиге:"
+grep -nE '^[[:space:]]*Include[[:space:]]' "$SSHD_CONFIG" || log "Активные Include отсутствуют."
+log "Состояние ssh.service: $(systemctl is-active ssh.service 2>/dev/null || true)"
+log "Состояние ssh.socket: $SSH_SOCKET_WAS_ACTIVE, $SSH_SOCKET_WAS_ENABLED"
+log "Фактические SSH-параметры до изменения:"
+sshd -T 2>/dev/null | grep -E '^(port|passwordauthentication|kbdinteractiveauthentication|pubkeyauthentication|authorizedkeysfile|permitrootlogin) ' || true
+
+if [ "$SSH_KEYS_READY" != true ] || ! id "$NEW_USER" >/dev/null 2>&1 || \
+   [ ! -d "$SSH_DIR" ] || [ ! -s "$SSH_DIR/authorized_keys" ] || \
+   [ "$(stat -c '%U:%G' "$SSH_DIR" 2>/dev/null)" != "$NEW_USER:$NEW_USER" ] || \
+   [ "$(stat -c '%a' "$SSH_DIR" 2>/dev/null)" != "700" ] || \
+   [ "$(stat -c '%U:%G' "$SSH_DIR/authorized_keys" 2>/dev/null)" != "$NEW_USER:$NEW_USER" ] || \
+   [ "$(stat -c '%a' "$SSH_DIR/authorized_keys" 2>/dev/null)" != "600" ] || \
+   ! authorized_keys_ed25519_only "$SSH_DIR/authorized_keys"; then
+    error "Пользователь, права или authorized_keys не прошли предварительную проверку."
+    exit 1
+fi
+log "Пользователь $NEW_USER, права и authorized_keys прошли проверку."
+
+cp "$SSHD_CONFIG" "$SSHD_BACKUP_FILE"
+: > "$SSH_SAFE_INCLUDES_FILE"
+: > "$SSH_DISABLED_INCLUDES_FILE"
+MAIN_MATCH_CONTEXT=false
+
+while IFS= read -r include_line; do
+    trimmed="${include_line#"${include_line%%[![:space:]]*}"}"
+    if [[ "${trimmed,,}" =~ ^match[[:space:]]+ ]]; then
+        MAIN_MATCH_CONTEXT=true
+        continue
+    fi
+    [[ "${trimmed,,}" =~ ^include[[:space:]]+ ]] || continue
+    trimmed="${trimmed%%#*}"
+    INCLUDE_CONFLICT=$MAIN_MATCH_CONTEXT
+    INCLUDE_MATCHED=false
+
+    for include_pattern in ${trimmed#* }; do
+        INCLUDE_PATTERN_MATCHED=false
+        [[ "$include_pattern" = /* ]] || include_pattern="/etc/ssh/$include_pattern"
+        while IFS= read -r include_file; do
+            INCLUDE_MATCHED=true
+            INCLUDE_PATTERN_MATCHED=true
+            log "Проверка provider Include: $include_file"
+            if ssh_include_has_conflict "$include_file"; then
+                INCLUDE_CONFLICT=true
+            fi
+        done < <(compgen -G "$include_pattern" 2>/dev/null || true)
+        if [ "$INCLUDE_PATTERN_MATCHED" != true ]; then
+            INCLUDE_CONFLICT=true
+            warn "Include отключён: невозможно проверить шаблон $include_pattern"
+        fi
+    done
+
+    if [ "$INCLUDE_MATCHED" != true ]; then
+        INCLUDE_CONFLICT=true
+    fi
+
+    if [ "$INCLUDE_CONFLICT" = true ]; then
+        {
+            echo "# disabled providers include"
+            echo "# $trimmed"
+        } >> "$SSH_DISABLED_INCLUDES_FILE"
+        warn "Include отключён из-за конфликтующих директив: $trimmed"
+    else
+        echo "$trimmed" >> "$SSH_SAFE_INCLUDES_FILE"
+    fi
+done < "$SSHD_BACKUP_FILE"
+
+write_managed_sshd_config yes true
 mkdir -p /run/sshd
 
 if ! sshd -t; then
-    error "Ошибка в конфигурации SSH! Восстанавливаю бэкап..."
-    if [ -f "$SSHD_BACKUP_FILE" ]; then
-        cp "$SSHD_BACKUP_FILE" /etc/ssh/sshd_config
-        if [ -n "$CUSTOM_SSHD_BACKUP_FILE" ] && [ -f "$CUSTOM_SSHD_BACKUP_FILE" ]; then
-            cp "$CUSTOM_SSHD_BACKUP_FILE" "$CUSTOM_SSHD_CONFIG"
-        else
-            rm -f "$CUSTOM_SSHD_CONFIG"
-        fi
-        log "Бэкап SSH конфига восстановлен"
-    fi
+    error "Новая основная SSH-конфигурация не прошла sshd -t."
+    restore_ssh_access
     exit 1
 fi
 
-# Блокируем пароль root только после успешной проверки SSH-конфигурации.
-# Учётная запись root сохраняется и остаётся доступной через sudo -i или консоль провайдера.
-log "Блокировка прямого входа root..."
-if passwd -l root >/dev/null 2>&1 && passwd -S root 2>/dev/null | awk '{print $2}' | grep -q '^L'; then
-    log "Пароль root заблокирован, прямой SSH-вход root запрещён"
-    add_check 0 "Root login отключён и пароль root заблокирован"
-else
-    error "Не удалось подтвердить блокировку пароля root. Остановка до перезапуска SSH."
-    add_check 1 "Блокировка root"
-    exit 1
-fi
-
-# 09.4 Исправление проблемы с socket (VDSina и др.)
-log "Переключение SSH с socket на service..."
+log "Переключение SSH с socket activation на ssh.service..."
 systemctl stop ssh.socket 2>/dev/null || true
 systemctl disable ssh.socket 2>/dev/null || true
-systemctl enable ssh.service
+systemctl enable ssh.service >/dev/null 2>&1 || true
 
-# 09.5 Перезапуск SSH
-log "Перезапуск SSH..."
-systemctl restart ssh
-
-# Проверка, что SSH слушает новый порт
-sleep 2
-if ss -tlnp | grep -q ":$SSH_PORT"; then
-    log "SSH слушает порт $SSH_PORT"
-    add_check 0 "SSH на порту $SSH_PORT"
-else
-    error "SSH не слушает порт $SSH_PORT!"
-    add_check 1 "SSH порт $SSH_PORT"
+if ! systemctl restart ssh; then
+    error "Не удалось перезапустить ssh.service."
+    restore_ssh_access
+    exit 1
 fi
 
-# Статус: вход по паролю отключен
-add_check 0 "Вход по паролю отключен"
+sleep 2
+if ! validate_managed_ssh_effective yes true || \
+   ! ssh_port_listening "$SSH_PORT" || ! ssh_port_listening 22; then
+    error "Фактическая временная SSH-конфигурация отличается от ожидаемой."
+    sshd -T 2>/dev/null | grep -E '^(port|passwordauthentication|pubkeyauthentication|authorizedkeysfile|permitrootlogin) ' || true
+    restore_ssh_access
+    exit 1
+fi
+
+log "SSH одновременно слушает временный порт 22 и новый порт $SSH_PORT."
+add_check 0 "Временная SSH-конфигурация на портах 22 и $SSH_PORT"
 
 # 10. FIREWALL (С ЗАЩИТОЙ ОТ БЛОКИРОВКИ) =======================================
 
@@ -644,7 +890,7 @@ if ! ufw_rule_exists "$SSH_PORT/tcp"; then
 fi
 
 # Сохраняем доступ через старый порт до ручной проверки нового подключения.
-if [ "$KEEP_LEGACY_SSH_PORT" = true ] && ! ufw_rule_exists "22/tcp"; then
+if ! ufw_rule_exists "22/tcp"; then
     ufw allow 22/tcp comment 'SSH Temporary Legacy Port'
 fi
 
@@ -678,117 +924,91 @@ else
     add_check 1 "Правило UFW для порта $SSH_PORT"
 fi
 
-# 11. ЗАКРЫТИЕ СТАРОГО SSH ПОРТА (ФИНАЛЬНЫЙ ЭТАП) =============================
+# 11. КОНТРОЛЬНЫЙ ВХОД И ФИНАЛЬНОЕ ЗАКРЫТИЕ ПОРТА 22 ===========================
 
-# Если порт 22 был закрыт до запуска, повторно его не открываем и вопрос не задаём.
-if [ "$KEEP_LEGACY_SSH_PORT" != true ]; then
-    log "Порт 22 уже закрыт, пропускаем"
-    add_check 0 "Закрытие порта 22 (уже закрыт)"
-else
-    # Автоматические проверки перед закрытием порта 22 (пункт 31)
-    SSH_VALIDATION_PASSED=true
-    
-    # Встроенная проверка SSH-валидации
-    SSH_DIR="/home/$NEW_USER/.ssh"
-    AUTH_KEYS="$SSH_DIR/authorized_keys"
-    
-    # Проверка 1: файл authorized_keys существует
-    if [ ! -f "$AUTH_KEYS" ]; then
-        error "Файл authorized_keys не существует: $AUTH_KEYS"
-        log "Порт 22 не будет закрыт автоматически из-за отсутствия SSH-ключей"
-        SSH_VALIDATION_PASSED=false
-    fi
-    
-    # Проверка 2: файл authorized_keys не пустой
-    if [ "$SSH_VALIDATION_PASSED" = true ] && [ ! -s "$AUTH_KEYS" ]; then
-        error "Файл authorized_keys пустой: $AUTH_KEYS"
-        log "Порт 22 не будет закрыт автоматически из-за пустого authorized_keys"
-        SSH_VALIDATION_PASSED=false
-    fi
-    
-    # Проверка 3: SSH слушает новый порт
-    if [ "$SSH_VALIDATION_PASSED" = true ] && ! ss -tlnp 2>/dev/null | grep -qE ":$SSH_PORT "; then
-        error "SSH не слушает порт $SSH_PORT"
-        log "Проверьте: sudo ss -tlnp | grep ssh"
-        SSH_VALIDATION_PASSED=false
-    fi
+SSH_VALIDATION_PASSED=true
 
-    # Проверка 4: старый порт действительно сохранён до ручного подтверждения
-    if [ "$SSH_VALIDATION_PASSED" = true ] && ! ss -tlnp 2>/dev/null | grep -qE '(:22\s|\.22\s)'; then
-        error "Порт 22 перестал слушаться до ручной проверки нового подключения"
-        SSH_VALIDATION_PASSED=false
-    fi
-    if [ "$SSH_VALIDATION_PASSED" = true ] && ! ufw_rule_exists "22/tcp"; then
-        error "В UFW отсутствует временное правило для порта 22"
-        SSH_VALIDATION_PASSED=false
-    fi
-    
-    # Проверка 5: содержимое authorized_keys валидно
-    if [ "$SSH_VALIDATION_PASSED" = true ]; then
-        has_valid_key=false
-        while IFS= read -r line; do
-            [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
-            if [[ "$line" =~ ^ssh-ed25519[[:space:]] ]]; then
-                has_valid_key=true
-                log "Найден валидный SSH-ключ типа ssh-ed25519"
-                break
-            fi
-        done < "$AUTH_KEYS"
-        
-        if [ "$has_valid_key" = false ] || ! authorized_keys_ed25519_only "$AUTH_KEYS"; then
-            error "authorized_keys должен содержать только валидные ключи ssh-ed25519"
-            SSH_VALIDATION_PASSED=false
-        fi
-    fi
-    
-    if [ "$SSH_VALIDATION_PASSED" = false ]; then
-        warn "АВТОМАТИЧЕСКИЕ ПРОВЕРКИ SSH НЕ ПРОЙДЕНЫ!"
-        warn "Порт 22 будет оставлен ОТКРЫТЫМ для предотвращения блокировки."
-        add_check 1 "Закрытие порта 22 (автоматические проверки не пройдены)"
-    fi
-    
-    # Продолжаем только если автоматические проверки прошли успешно
-    if [ "$SSH_VALIDATION_PASSED" = true ]; then
-        warn "ВНИМАНИЕ! Автоматические проверки SSH пройдены успешно:"
-        warn "  ✓ authorized_keys существует и не пустой"
-        warn "  ✓ SSH слушает новый порт $SSH_PORT"
-        warn "  ✓ Валидный SSH-ключ присутствует"
-        warn ""
-        warn "Перед продолжением дополнительно проверьте:"
-        warn "1. Откройте НОВОЕ окно терминала"
-        warn "2. Подключитесь: ssh -p $SSH_PORT $NEW_USER@$(hostname -I | awk '{print $1}')"
-        warn "3. Убедитесь, что подключение работает!"
-        warn ""
-        read -p "Подключение работает? Закрыть порт 22? (yes/no): " confirm
-
-        if [ "$confirm" = "yes" ]; then
-            sed -i '/^# Временный порт до ручной проверки подключения$/d; /^Port 22$/d' "$CUSTOM_SSHD_CONFIG"
-            if sshd -t && systemctl restart ssh; then
-                ufw delete allow 22/tcp 2>/dev/null || true
-                if ! ss -tlnp 2>/dev/null | grep -qE '(:22\s|\.22\s)'; then
-                    log "Порт 22 закрыт"
-                    add_check 0 "Закрытие порта 22"
-                else
-                    error "SSH продолжает слушать порт 22. Проверьте конфигурацию вручную."
-                    add_check 1 "Закрытие порта 22"
-                fi
-            else
-                error "Не удалось применить закрытие порта 22. Восстанавливаю временный доступ."
-                {
-                    echo ""
-                    echo "# Временный порт до ручной проверки подключения"
-                    echo "Port 22"
-                } >> "$CUSTOM_SSHD_CONFIG"
-                systemctl restart ssh 2>/dev/null || true
-                add_check 1 "Закрытие порта 22"
-            fi
-        else
-            warn "Порт 22 оставлен открытым! Закройте его вручную позже:"
-            warn "Удалите строку 'Port 22' из $CUSTOM_SSHD_CONFIG, перезапустите SSH и удалите правило UFW."
-            add_check 1 "Закрытие порта 22 (отложено)"
-        fi
-    fi
+if ! validate_managed_ssh_effective yes true || \
+   ! ssh_port_listening "$SSH_PORT" || ! ssh_port_listening 22 || \
+   ! ufw_rule_exists "$SSH_PORT/tcp" || ! ufw_rule_exists "22/tcp" || \
+   ! authorized_keys_ed25519_only "$SSH_DIR/authorized_keys"; then
+    SSH_VALIDATION_PASSED=false
 fi
+
+if [ "$SSH_VALIDATION_PASSED" != true ]; then
+    error "Автоматические проверки перед контрольным входом не пройдены."
+    warn "Порт 22 и временный вход root сохранены."
+    add_check 1 "Контрольный вход SSH (автоматические проверки)"
+else
+    warn "Перед продолжением обязательно проверьте вход в НОВОМ окне:"
+    warn "ssh -p $SSH_PORT $NEW_USER@$SERVER_IP"
+    warn "Не закрывайте текущую root-сессию."
+    confirm=""
+
+    if [ -r /dev/tty ]; then
+        IFS= read -r -p "Контрольный вход работает? Закрыть порт 22 и заблокировать root? (y/N): " confirm </dev/tty || confirm=""
+    else
+        warn "Нет интерактивного терминала для контрольного подтверждения."
+        warn "SSH-hardening остановлен: порт 22 и временный вход root сохранены."
+    fi
+
+    case "$confirm" in
+        y|Y|yes)
+            log "Применение финальной SSH-конфигурации..."
+            write_managed_sshd_config no false
+
+            FINAL_SSH_OK=true
+            if ! sshd -t; then
+                error "Финальная SSH-конфигурация не прошла sshd -t."
+                FINAL_SSH_OK=false
+            elif ! systemctl restart ssh; then
+                error "Не удалось перезапустить SSH с финальной конфигурацией."
+                FINAL_SSH_OK=false
+            else
+                sleep 2
+                if ! validate_managed_ssh_effective no false || \
+                   ! ssh_port_listening "$SSH_PORT" || ssh_port_listening 22; then
+                    error "Фактическая финальная SSH-конфигурация отличается от ожидаемой."
+                    FINAL_SSH_OK=false
+                fi
+            fi
+
+            if [ "$FINAL_SSH_OK" = true ]; then
+                if ! passwd -l root >/dev/null 2>&1 || \
+                   ! passwd -S root 2>/dev/null | awk '{print $2}' | grep -q '^L'; then
+                    error "Не удалось подтвердить блокировку пароля root."
+                    FINAL_SSH_OK=false
+                fi
+            fi
+
+            if [ "$FINAL_SSH_OK" = true ] && ufw_rule_exists "22/tcp"; then
+                if ! ufw --force delete allow 22/tcp >/dev/null 2>&1; then
+                    error "Не удалось удалить правило UFW для порта 22."
+                    FINAL_SSH_OK=false
+                fi
+            fi
+            if [ "$FINAL_SSH_OK" = true ] && ufw_rule_exists "22/tcp"; then
+                error "Правило UFW для порта 22 осталось после удаления."
+                FINAL_SSH_OK=false
+            fi
+
+            if [ "$FINAL_SSH_OK" = true ]; then
+                log "Контрольный вход подтверждён: порт 22 закрыт, root заблокирован."
+                add_check 0 "Финальная SSH-конфигурация"
+            else
+                error "Ошибка финального этапа. Выполняется полный откат."
+                restore_ssh_access
+                add_check 1 "Финальная SSH-конфигурация (выполнен откат)"
+            fi
+            ;;
+        *)
+            warn "Подтверждение не получено. Порт 22 и временный вход root сохранены."
+            add_check 1 "Финальная SSH-конфигурация (отложена)"
+            ;;
+    esac
+fi
+
+rm -f "$SSH_SAFE_INCLUDES_FILE" "$SSH_DISABLED_INCLUDES_FILE"
 
 # 12. НАСТРОЙКА FAIL2BAN (ЗАЩИTA SSH ОТ БРУТФОРСА) ============================
 
@@ -912,13 +1132,22 @@ add_check $AUDIT_RULES_VALIDATION_OK "Настройка правил аудит
 
 log "Настройка автоматических обновлений безопасности..."
 
-# Сохраняем результат установки пакетов
-AUTO_UPDATE_INSTALL=0
-apt-get install -y -qq unattended-upgrades apt-listchanges || AUTO_UPDATE_INSTALL=$?
+UNATTENDED_CONFIG="/etc/apt/apt.conf.d/50unattended-upgrades"
+UNATTENDED_BACKUP="${UNATTENDED_CONFIG}.bak.$(date +%s)"
+UNATTENDED_CONFIG_EXISTED=false
+AUTO_UPDATE_FAILURE=""
 
-# Настройка: только security-обновления, с явным управлением перезагрузкой
-# Записываем КОНФИГ ПЕРЕД dpkg-reconfigure, чтобы не сбросилось
-cat > /etc/apt/apt.conf.d/50unattended-upgrades << 'EOF'
+if [ -f "$UNATTENDED_CONFIG" ]; then
+    UNATTENDED_CONFIG_EXISTED=true
+    cp "$UNATTENDED_CONFIG" "$UNATTENDED_BACKUP"
+fi
+
+if ! apt-get install -y -qq unattended-upgrades apt-listchanges; then
+    AUTO_UPDATE_FAILURE="не удалось установить unattended-upgrades"
+else
+    dpkg-reconfigure -plow unattended-upgrades -fnoninteractive >/dev/null 2>&1 || true
+
+    cat > "$UNATTENDED_CONFIG" << 'EOF'
 Unattended-Upgrade::Allowed-Origins {
     "${distro_id}:${distro_codename}-security";
 };
@@ -933,113 +1162,127 @@ Unattended-Upgrade::Automatic-Reboot "false";
 Unattended-Upgrade::Automatic-Reboot-Time "03:00";
 EOF
 
-# Включаем автоматические обновления (после записи конфига)
-DPKG_RECONFIGURE_RESULT=0
-dpkg-reconfigure -plow unattended-upgrades -fnoninteractive || DPKG_RECONFIGURE_RESULT=$?
+    systemctl enable --now apt-daily.timer apt-daily-upgrade.timer >/dev/null 2>&1 || true
 
-# Сохраняем результат включения сервисов
-SYSTEMD_RESULT=0
-systemctl enable apt-daily.timer || SYSTEMD_RESULT=$?
-systemctl start apt-daily.timer || SYSTEMD_RESULT=$?
-systemctl enable apt-daily-upgrade.timer || SYSTEMD_RESULT=$?
-systemctl start apt-daily-upgrade.timer || SYSTEMD_RESULT=$?
+    APT_EFFECTIVE_CONFIG=$(apt-config dump 2>/dev/null)
+    if ! grep -Fq 'Unattended-Upgrade::Allowed-Origins:: "${distro_id}:${distro_codename}-security";' <<< "$APT_EFFECTIVE_CONFIG"; then
+        AUTO_UPDATE_FAILURE="security origin отсутствует в итоговой APT-конфигурации"
+    elif ! grep -Fq 'Unattended-Upgrade::Automatic-Reboot "false";' <<< "$APT_EFFECTIVE_CONFIG"; then
+        AUTO_UPDATE_FAILURE="автоматическая перезагрузка не отключена"
+    elif ! systemctl is-enabled --quiet apt-daily.timer apt-daily-upgrade.timer || \
+         ! systemctl is-active --quiet apt-daily.timer apt-daily-upgrade.timer; then
+        AUTO_UPDATE_FAILURE="таймеры apt-daily и apt-daily-upgrade не включены или не активны"
+    fi
+fi
 
-# Проверяем результат установки пакетов и статус сервиса
-add_check $AUTO_UPDATE_INSTALL "Автоматические обновления"
-if systemctl is-enabled --quiet apt-daily.timer 2>/dev/null && systemctl is-enabled --quiet apt-daily-upgrade.timer 2>/dev/null; then
-    add_check 0 "APT auto-update timers enabled"
+if [ -z "$AUTO_UPDATE_FAILURE" ]; then
+    add_result "OK" "Unattended-upgrades" "security-обновления активны, автоматическая перезагрузка отключена"
 else
-    add_check 1 "APT auto-update timers enabled"
+    if [ "$UNATTENDED_CONFIG_EXISTED" = true ]; then
+        cp "$UNATTENDED_BACKUP" "$UNATTENDED_CONFIG"
+    else
+        rm -f "$UNATTENDED_CONFIG"
+    fi
+    add_result "FAIL" "Unattended-upgrades" "$AUTO_UPDATE_FAILURE"
 fi
-AUTO_UPDATE_CONFIG_OK=$DPKG_RECONFIGURE_RESULT
-if ! file_contains "/etc/apt/apt.conf.d/50unattended-upgrades" 'Automatic-Reboot "false"'; then
-    AUTO_UPDATE_CONFIG_OK=1
-fi
-if ! file_contains "/etc/apt/apt.conf.d/50unattended-upgrades" 'Allowed-Origins'; then
-    AUTO_UPDATE_CONFIG_OK=1
-fi
-add_check $AUTO_UPDATE_CONFIG_OK "Конфиг unattended-upgrades"
 
 # 15. НАСТРОЙКА NEEDRESTART (АВТОМАТИЧЕСКИЙ ПЕРЕЗАПУСК СЕРВИСОВ) =============
 
 log "Настройка needrestart (автоматический перезапуск сервисов)..."
 
-# Установка needrestart (обычно уже установлен в Ubuntu 24.04)
-apt-get install -y -qq needrestart 2>/dev/null || true
+NEEDRESTART_CONFIG="/etc/needrestart/needrestart.conf"
+NEEDRESTART_BACKUP="${NEEDRESTART_CONFIG}.bak.$(date +%s)"
+NEEDRESTART_SECTION=$(mktemp)
+NEEDRESTART_FAILURE=""
 
-# Создание конфига с автоматическим перезапуском сервисов
-mkdir -p /etc/needrestart/conf.d
-cat > /etc/needrestart/conf.d/99-auto.conf << 'EOF'
-# Автоматический перезапуск сервисов при обновлении (без интерактивного режима)
+if ! apt-get install -y -qq needrestart >/dev/null 2>&1; then
+    NEEDRESTART_FAILURE="не удалось установить пакет"
+else
+    if [ ! -f "$NEEDRESTART_CONFIG" ]; then
+        NEEDRESTART_FAILURE="основной конфиг после установки пакета не найден"
+    else
+        cp "$NEEDRESTART_CONFIG" "$NEEDRESTART_BACKUP"
+        cat > "$NEEDRESTART_SECTION" << 'EOF'
+# Автоматический перезапуск сервисов после обновлений.
 $nrconf{restart} = 'a';
 EOF
+        replace_managed_section "$NEEDRESTART_CONFIG" "needrestart" "$NEEDRESTART_SECTION"
+    fi
+    rm -f "$NEEDRESTART_SECTION"
 
-# Проверка, что конфиг создан
-if [ -f "/etc/needrestart/conf.d/99-auto.conf" ] && file_contains "/etc/needrestart/conf.d/99-auto.conf" "\\\$nrconf\\{restart\\} = 'a';"; then
-    log "Конфигурация needrestart создана"
-    add_check 0 "Настройка needrestart"
-else
-    warn "Не удалось создать конфигурацию needrestart"
-    add_check 1 "Настройка needrestart"
+    if [ -z "$NEEDRESTART_FAILURE" ] && ! perl -c "$NEEDRESTART_CONFIG" >/dev/null 2>&1; then
+        NEEDRESTART_FAILURE="основной Perl-конфиг не прошёл синтаксическую проверку"
+    elif [ -z "$NEEDRESTART_FAILURE" ] && ! perl -e 'our %nrconf; do "/etc/needrestart/needrestart.conf"; exit (($nrconf{restart} // "") eq "a" ? 0 : 1);'; then
+        NEEDRESTART_FAILURE="итоговое значение restart не равно a"
+    fi
 fi
+
+if [ -z "$NEEDRESTART_FAILURE" ]; then
+    add_result "OK" "Needrestart" "автоматический перезапуск сервисов включён"
+else
+    [ -f "$NEEDRESTART_BACKUP" ] && cp "$NEEDRESTART_BACKUP" "$NEEDRESTART_CONFIG"
+    add_result "FAIL" "Needrestart" "$NEEDRESTART_FAILURE"
+fi
+
 # 16. НАСТРОЙКА JOURNALD (ЦЕНТРАЛИЗОВАННЫЕ ЛОГИ) =================================
 
 log "Настройка journald (системный журнал)..."
 
-# Бэкап оригинального конфига
-if [ -f "/etc/systemd/journald.conf" ]; then
-    cp /etc/systemd/journald.conf /etc/systemd/journald.conf.bak.$(date +%s)
+JOURNALD_CONFIG="/etc/systemd/journald.conf"
+JOURNALD_BACKUP="${JOURNALD_CONFIG}.bak.$(date +%s)"
+JOURNALD_FAILURE=""
+JOURNALD_CHECK_SINCE=$(date --iso-8601=seconds)
+JOURNALD_CONFIG_EXISTED=false
+if [ -f "$JOURNALD_CONFIG" ]; then
+    JOURNALD_CONFIG_EXISTED=true
+    cp "$JOURNALD_CONFIG" "$JOURNALD_BACKUP"
 fi
 
-# Создание конфига с persistent storage и лимитами
-cat > /etc/systemd/journald.conf << EOF
+cat > "$JOURNALD_CONFIG" << 'EOF'
 [Journal]
-# Хранение логов в постоянном хранилище (не в памяти)
 Storage=persistent
-
-# Лимит размера логов
 SystemMaxUse=500M
 SystemMaxFileSize=100M
 SystemMaxFiles=10
-SystemMaxFilesSec=1month
-
-# Лимиты для логов пользователей
 RuntimeMaxUse=100M
 RuntimeMaxFileSize=10M
 RuntimeMaxFiles=5
-
-# Сжатие логов
 Compress=yes
-
-# Срок хранения логов
 MaxRetentionSec=1month
-
-# Синхронизация логов на диск
 SyncIntervalSec=5m
 EOF
 
-# Перезапуск journald для применения настроек
-systemctl restart systemd-journald 2>/dev/null || true
+mkdir -p /var/log/journal
+systemd-tmpfiles --create --prefix /var/log/journal >/dev/null 2>&1 || true
 
-# Проверка, что journald работает
-if systemctl is-active systemd-journald &>/dev/null; then
-    JOURNALD_VALIDATION_OK=0
-    if ! file_contains "/etc/systemd/journald.conf" '^Storage=persistent$'; then
-        JOURNALD_VALIDATION_OK=1
-    fi
-    if ! file_contains "/etc/systemd/journald.conf" '^SystemMaxUse=500M$'; then
-        JOURNALD_VALIDATION_OK=1
-    fi
-    log "Journald настроен и перезапущен"
-    add_check $JOURNALD_VALIDATION_OK "Настройка journald"
+if ! systemctl restart systemd-journald; then
+    JOURNALD_FAILURE="не удалось перезапустить systemd-journald"
+elif ! systemctl is-active --quiet systemd-journald; then
+    JOURNALD_FAILURE="systemd-journald не активен после перезапуска"
+elif [ ! -d /var/log/journal ]; then
+    JOURNALD_FAILURE="persistent storage /var/log/journal отсутствует"
+elif journalctl -u systemd-journald --since "$JOURNALD_CHECK_SINCE" --no-pager 2>/dev/null | grep -qiE 'unknown key|invalid|failed|error'; then
+    JOURNALD_FAILURE="journald сообщил об ошибке или неизвестной директиве"
 else
-    warn "Не удалось перезапустить journald"
-    add_check 1 "Настройка journald"
+    JOURNALD_EFFECTIVE=$(systemd-analyze cat-config systemd/journald.conf 2>/dev/null)
+    if ! grep -qx 'Storage=persistent' <<< "$JOURNALD_EFFECTIVE" || \
+       ! grep -qx 'SystemMaxUse=500M' <<< "$JOURNALD_EFFECTIVE"; then
+        JOURNALD_FAILURE="итоговая конфигурация не содержит ожидаемых значений"
+    fi
 fi
 
-# Проверка размера логов
-JOURNAL_SIZE=$(journalctl --disk-usage 2>/dev/null | head -1 || echo "недоступно")
-log "Размер логов: $JOURNAL_SIZE"
+if [ -z "$JOURNALD_FAILURE" ]; then
+    JOURNAL_SIZE=$(journalctl --disk-usage 2>/dev/null | head -1 || echo "размер недоступен")
+    add_result "OK" "Journald" "persistent storage активен, лимит 500M; $JOURNAL_SIZE"
+else
+    if [ "$JOURNALD_CONFIG_EXISTED" = true ]; then
+        cp "$JOURNALD_BACKUP" "$JOURNALD_CONFIG"
+    else
+        rm -f "$JOURNALD_CONFIG"
+    fi
+    systemctl restart systemd-journald >/dev/null 2>&1 || true
+    add_result "FAIL" "Journald" "$JOURNALD_FAILURE; исходный конфиг восстановлен"
+fi
 
 # 17. НАСТРОЙКА ЛОГРОТАЦИИ =====================================================
 
@@ -1104,55 +1347,67 @@ fi
 
 # 18. НАСТРОЙКА MOTD ===========================================================
 
-log "Настройка MOTD (сообщения при входе)..."
+log "Настройка статического MOTD..."
 
-# Создаем кастомный MOTD
-cat > /etc/motd << 'EOF'
-╔══════════════════════════════════════════════════════════════╗
-║                    БЕЗОПАСНЫЙ ДОСТУП                         ║
-║                                                              ║
-║  Вход разрешен только по SSH-ключу                           ║
-║  Дополнительная аутентификация: fail2ban                     ║
-║                                                              ║
-║  Для подключения используйте:                                ║
-║  ssh -p <PORT> <user>@<server>                               ║
-║                                                              ║
-║  ВНИМАНИЕ: Все действия на сервере логируются                ║
-╚══════════════════════════════════════════════════════════════╝
+MOTD_FILE="/etc/motd"
+PAM_SSHD_FILE="/etc/pam.d/sshd"
+MOTD_BACKUP="${MOTD_FILE}.bak.$(date +%s)"
+PAM_SSHD_BACKUP="${PAM_SSHD_FILE}.bak.$(date +%s)"
+MOTD_FAILURE=""
+MOTD_FILE_EXISTED=false
+
+if [ -e "$MOTD_FILE" ]; then
+    MOTD_FILE_EXISTED=true
+    cp -a "$MOTD_FILE" "$MOTD_BACKUP"
+fi
+[ -e "$PAM_SSHD_FILE" ] && cp -a "$PAM_SSHD_FILE" "$PAM_SSHD_BACKUP"
+
+cat > "$MOTD_FILE" << 'EOF'
+БЕЗОПАСНЫЙ ДОСТУП
+
+Вход по SSH разрешен только по ключу.
+Действия на сервере могут регистрироваться в системном журнале.
 EOF
 
-# Отключаем стандартный MOTD в /etc/legal
-if [ -f "/etc/legal" ]; then
-    cp /etc/legal /etc/legal.bak.$(date +%s)
-    echo "" > /etc/legal
+if [ -f "$PAM_SSHD_FILE" ]; then
+    MOTD_PAM_TEMP=$(mktemp)
+    awk '
+        /^[[:space:]]*#/ { print; next }
+        /^[[:space:]]*session[[:space:]]+optional[[:space:]]+pam_motd\.so[[:space:]]+noupdate([[:space:]]|$)/ { next }
+        /pam_motd\.so/ { print "# disabled by tuning-VPS: " $0; next }
+        { print }
+        END { print "session optional pam_motd.so noupdate" }
+    ' "$PAM_SSHD_FILE" > "$MOTD_PAM_TEMP"
+    install -m 0644 "$MOTD_PAM_TEMP" "$PAM_SSHD_FILE"
+    rm -f "$MOTD_PAM_TEMP"
+else
+    MOTD_FAILURE="/etc/pam.d/sshd не найден"
 fi
 
-# Отключаем динамический MOTD в /etc/pam.d/sshd
-if [ -f "/etc/pam.d/sshd" ]; then
-    cp /etc/pam.d/sshd /etc/pam.d/sshd.bak.$(date +%s)
-    sed -i 's/^session    optional     pam_motd.so/# session    optional     pam_motd.so/' /etc/pam.d/sshd
-    sed -i 's/^session    optional     pam_motd.so noupdate/# session    optional     pam_motd.so noupdate/' /etc/pam.d/sshd
+if [ -z "$MOTD_FAILURE" ] && [ ! -s "$MOTD_FILE" ]; then
+    MOTD_FAILURE="/etc/motd пуст"
+fi
+if [ -z "$MOTD_FAILURE" ] && grep -Eq '^[[:space:]]*session[[:space:]]+.*pam_motd\.so.*motd=/run/motd\.dynamic' "$PAM_SSHD_FILE"; then
+    MOTD_FAILURE="динамический MOTD остался активен в PAM"
+fi
+if [ -z "$MOTD_FAILURE" ] && [ "$(grep -Ec '^[[:space:]]*session[[:space:]]+.*pam_motd\.so[[:space:]]+noupdate([[:space:]]|$)' "$PAM_SSHD_FILE")" -ne 1 ]; then
+    MOTD_FAILURE="статический MOTD не подключен в PAM ровно один раз"
+fi
+if [ -z "$MOTD_FAILURE" ] && ! sshd -T 2>/dev/null | grep -qx 'printmotd no'; then
+    MOTD_FAILURE="эффективная настройка SSH PrintMotd отличается от no"
 fi
 
-# Отключаем скрипты в /etc/update-motd.d/
-if [ -d "/etc/update-motd.d" ]; then
-    chmod -x /etc/update-motd.d/* 2>/dev/null || true
+if [ -z "$MOTD_FAILURE" ]; then
+    add_result "OK" "MOTD" "статический /etc/motd подключен через PAM, динамический MOTD отключен"
+else
+    if [ "$MOTD_FILE_EXISTED" = true ]; then
+        cp -a "$MOTD_BACKUP" "$MOTD_FILE"
+    else
+        rm -f "$MOTD_FILE"
+    fi
+    [ -e "$PAM_SSHD_BACKUP" ] && cp -a "$PAM_SSHD_BACKUP" "$PAM_SSHD_FILE"
+    add_result "FAIL" "MOTD" "$MOTD_FAILURE; исходные файлы восстановлены"
 fi
-
-# Добавляем PrintMotd no в sshd_config (надежное отключение MOTD)
-if ! grep -q "^PrintMotd no" /etc/ssh/sshd_config.d/99-custom.conf 2>/dev/null; then
-    echo "PrintMotd no" >> /etc/ssh/sshd_config.d/99-custom.conf
-fi
-
-log "MOTD настроен (динамический MOTD отключен)"
-MOTD_VALIDATION_OK=0
-if [ ! -s "/etc/motd" ]; then
-    MOTD_VALIDATION_OK=1
-fi
-if ! file_contains "/etc/ssh/sshd_config.d/99-custom.conf" '^PrintMotd no$'; then
-    MOTD_VALIDATION_OK=1
-fi
-add_check $MOTD_VALIDATION_OK "Настройка MOTD"
 
 
 # 19. ПРОВЕРКА SSH С ПОМОЩЬЮ SSH-AUDIT ========================================
@@ -1230,7 +1485,11 @@ else
 fi
 echo -e "  UFW статус:      $UFW_STATUS_FMT"
 echo -e "  Открытые порты:  $(ss -tlnp 2>/dev/null | grep LISTEN | wc -l) шт."
-DOCKER_VER=$(docker --version 2>/dev/null | cut -d' ' -f3 | tr -d ',' || echo 'не установлен')
+if command -v docker &>/dev/null; then
+    DOCKER_VER=$(docker --version 2>/dev/null | cut -d' ' -f3 | tr -d ',')
+else
+    DOCKER_VER="не установлен"
+fi
 echo -e "  Docker:          $DOCKER_VER"
 
 echo ""
@@ -1245,23 +1504,23 @@ done
 echo ""
 echo "Проверка SSH конфигурации:"
 echo "--------------------------"
-echo -n "  Порт в конфиге: "
-grep "^Port $SSH_PORT" /etc/ssh/sshd_config.d/99-custom.conf &>/dev/null && echo -e "${GREEN}OK${NC}" || echo -e "${RED}FAIL${NC}"
+echo -n "  Основной конфиг: "
+grep "^# Managed by setup_ubuntu_24.04.sh$" "$SSHD_CONFIG" &>/dev/null && echo -e "${GREEN}managed${NC}" || echo -e "${RED}FAIL${NC}"
+
+echo -n "  Порт применён:  "
+ssh_effective_has "port $SSH_PORT" && echo -e "${GREEN}OK${NC}" || echo -e "${RED}FAIL${NC}"
 
 echo -n "  PasswordAuth:   "
-grep "^PasswordAuthentication no" /etc/ssh/sshd_config.d/99-custom.conf &>/dev/null && echo -e "${GREEN}disabled${NC}" || echo -e "${RED}FAIL${NC}"
+ssh_effective_has "passwordauthentication no" && echo -e "${GREEN}disabled${NC}" || echo -e "${RED}FAIL${NC}"
 
 echo -n "  PubkeyAuth:     "
-grep "^PubkeyAuthentication yes" /etc/ssh/sshd_config.d/99-custom.conf &>/dev/null && echo -e "${GREEN}enabled${NC}" || echo -e "${RED}FAIL${NC}"
-
-echo -n "  User key type:  "
-grep "^PubkeyAcceptedAlgorithms ssh-ed25519$" /etc/ssh/sshd_config.d/99-custom.conf &>/dev/null && echo -e "${GREEN}ssh-ed25519 only${NC}" || echo -e "${RED}FAIL${NC}"
+ssh_effective_has "pubkeyauthentication yes" && echo -e "${GREEN}enabled${NC}" || echo -e "${RED}FAIL${NC}"
 
 echo -n "  Root SSH login: "
-grep "^PermitRootLogin no$" /etc/ssh/sshd_config.d/99-custom.conf &>/dev/null && echo -e "${GREEN}disabled${NC}" || echo -e "${RED}FAIL${NC}"
+ssh_effective_has "permitrootlogin no" && echo -e "${GREEN}disabled${NC}" || echo -e "${YELLOW}temporary${NC}"
 
 echo -n "  Root password:  "
-passwd -S root 2>/dev/null | awk '{print $2}' | grep -q '^L' && echo -e "${GREEN}locked${NC}" || echo -e "${RED}FAIL${NC}"
+passwd -S root 2>/dev/null | awk '{print $2}' | grep -q '^L' && echo -e "${GREEN}locked${NC}" || echo -e "${YELLOW}temporary unlocked${NC}"
 
 echo ""
 echo "Сетевые интерфейсы:"
@@ -1296,14 +1555,9 @@ check_pkg "pip3"
 echo ""
 
 echo "Docker:"
-    if command -v "docker" &>/dev/null; then
-        check_pkg "docker"
-        DOCKER_INSTALLED=true
-    else
-        check_pkg "docker"
-    fi
-    # Проверка docker compose (плагин) вместо устаревшего docker-compose
-    # Блок удален
+check_pkg "docker"
+detect_docker_state
+echo "  Состояние: $DOCKER_STATE"
 
 echo "Веб-серверы:"
 check_service "nginx" "nginx"
@@ -1344,80 +1598,102 @@ echo ""
 
 # 21. УСТАНОВКА DOCKER (ОПЦИОНАЛЬНО)
 
-if [ "$DOCKER_INSTALLED" = false ]; then
+detect_docker_state
+if [ "$DOCKER_STATE" = "not-installed" ]; then
     echo ""
     read -p "Установить Docker? (y/N): " install_docker
 
     if [ "$install_docker" = "y" ] || [ "$install_docker" = "Y" ]; then
         log "Установка Docker..."
+        DOCKER_INSTALL_OK=true
 
         # Удаляем старые версии
         apt-get remove -y docker docker-engine docker.io containerd runc 2>/dev/null || true
 
         # Установка зависимостей
-        apt-get install -y -qq ca-certificates curl gnupg
+        apt-get install -y -qq ca-certificates curl gnupg || DOCKER_INSTALL_OK=false
 
         # Добавление репозитория Docker
-        install -m 0755 -d /etc/apt/keyrings
-        curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
-        chmod a+r /etc/apt/keyrings/docker.asc
+        install -m 0755 -d /etc/apt/keyrings || DOCKER_INSTALL_OK=false
+        curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc || DOCKER_INSTALL_OK=false
+        chmod a+r /etc/apt/keyrings/docker.asc || DOCKER_INSTALL_OK=false
 
         echo \
           "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu \
           $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | \
-          tee /etc/apt/sources.list.d/docker.list > /dev/null
+          tee /etc/apt/sources.list.d/docker.list > /dev/null || DOCKER_INSTALL_OK=false
 
-        apt-get update -qq
-        apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+        apt-get update -qq || DOCKER_INSTALL_OK=false
+        apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin || DOCKER_INSTALL_OK=false
 
         # Добавляем пользователя в группу docker
-        usermod -aG docker "$NEW_USER"
+        usermod -aG docker "$NEW_USER" || DOCKER_INSTALL_OK=false
 
         # Запускаем Docker (с обработкой ошибок)
         log "Запуск Docker сервиса..."
-        if systemctl enable docker 2>/dev/null && systemctl start docker 2>/dev/null; then
+        if [ "$DOCKER_INSTALL_OK" = true ] && systemctl enable docker 2>/dev/null && systemctl start docker 2>/dev/null; then
             sleep 2
-            if docker --version > /dev/null 2>&1; then
+            detect_docker_state
+            if [ "$DOCKER_STATE" = "installed-running" ]; then
                 log "Docker установлен: $(docker --version)"
+                add_result "OK" "Docker" "установлен и запущен"
             else
                 warn "Docker установлен, но не запущен. Попробуйте перезагрузить сервер."
+                add_result "WARN" "Docker" "установлен, но daemon недоступен"
             fi
         else
+            DOCKER_STATE="installation-failed"
             warn "Не удалось запустить Docker сервис. Возможные причины:"
             warn "  - Конфликт с systemd (если контейнер)"
             warn "  - Нужна перезагрузка сервера"
             warn "  - Проверьте: sudo systemctl status docker"
+            add_result "FAIL" "Docker" "установка завершилась ошибкой или сервис не запустился"
         fi
     else
+        DOCKER_STATE="skipped"
         log "Установка Docker пропущена"
+        add_result "SKIP" "Docker" "пользователь отказался от установки"
     fi
 else
-    log "Docker уже установлен, пропускаем установку"
+    if [ "$DOCKER_STATE" = "installed-stopped" ]; then
+        systemctl start docker 2>/dev/null || true
+        sleep 2
+        detect_docker_state
+    fi
+    if [ "$DOCKER_STATE" = "installed-running" ]; then
+        log "Docker уже установлен и запущен"
+        add_result "OK" "Docker" "уже был установлен и доступен"
+    else
+        warn "Docker установлен, но daemon недоступен"
+        add_result "WARN" "Docker" "установлен, но daemon недоступен"
+    fi
 fi
 # 22. УСТАНОВКА MTPROTO PROXY (ОПЦИОНАЛЬНО)
 
-# Проверяем, доступен ли Docker (установлен ли он только что или ранее)
-DOCKER_AVAILABLE=false
-if command -v docker &>/dev/null && docker info &>/dev/null; then
-    DOCKER_AVAILABLE=true
-elif command -v docker &>/dev/null; then
-    # Docker установлен, но возможно не запущен - пробуем запустить
-    systemctl start docker 2>/dev/null || true
-    sleep 2
-    docker info &>/dev/null && DOCKER_AVAILABLE=true
+# MTProto можно устанавливать только через проверенный работающий Docker daemon.
+if [ "$DOCKER_STATE" != "skipped" ] && [ "$DOCKER_STATE" != "installation-failed" ]; then
+    detect_docker_state
 fi
-if [ "$DOCKER_AVAILABLE" = true ]; then
+if [ "$DOCKER_STATE" = "installed-running" ]; then
     echo ""
     MTPROTO_IMPLEMENTATION=""
-    read -p "Установить MTProto от 9seconds [9seconds/mtg](https://github.com/9seconds/mtg)? (y/N): " install_mtg
+    read -p "Установить сервис MTProto? (y/N): " install_mtproto
 
-    if [ "$install_mtg" = "y" ] || [ "$install_mtg" = "Y" ]; then
-        MTPROTO_IMPLEMENTATION="9seconds/mtg"
+    if [ "$install_mtproto" = "y" ] || [ "$install_mtproto" = "Y" ]; then
+        echo ""
+        echo "Выберите реализацию MTProto:"
+        echo "  1. MTProto от 9seconds [9seconds/mtg](https://github.com/9seconds/mtg)"
+        echo "  2. MTProto от seriyps [seriyps/mtproto_proxy](https://github.com/seriyps/mtproto_proxy)"
+        echo "  0. Отказаться"
+        read -p "Ваш выбор [0-2]: " mtproto_choice
+
+        case "$mtproto_choice" in
+            1) MTPROTO_IMPLEMENTATION="9seconds/mtg" ;;
+            2) MTPROTO_IMPLEMENTATION="seriyps/mtproto_proxy" ;;
+            *) MTPROTO_STATE="skipped" ;;
+        esac
     else
-        read -p "Установить MTProto от seriyps [seriyps/mtproto_proxy](https://github.com/seriyps/mtproto_proxy)? (y/N): " install_seriyps
-        if [ "$install_seriyps" = "y" ] || [ "$install_seriyps" = "Y" ]; then
-            MTPROTO_IMPLEMENTATION="seriyps/mtproto_proxy"
-        fi
+        MTPROTO_STATE="skipped"
     fi
 
     if [ -n "$MTPROTO_IMPLEMENTATION" ]; then
@@ -1504,20 +1780,26 @@ if [ "$DOCKER_AVAILABLE" = true ]; then
                 echo "  Удаление: docker rm -f mtproto-proxy"
                 echo ""
 
-                CHECKS+=("${GREEN}[OK]${NC} MTProto Proxy $MTPROTO_IMPLEMENTATION (порт 443)")
+                MTPROTO_STATE="running"
+                add_result "OK" "MTProto Proxy" "$MTPROTO_IMPLEMENTATION запущен на порту 443"
             else
                 error "Контейнер MTProto не запустился. Проверьте логи: docker logs mtproto-proxy"
-                CHECKS+=("${RED}[FAIL]${NC} MTProto Proxy $MTPROTO_IMPLEMENTATION (ошибка запуска)")
+                MTPROTO_STATE="failed"
+                add_result "FAIL" "MTProto Proxy" "$MTPROTO_IMPLEMENTATION: контейнер не запустился"
             fi
         else
             error "Не удалось сгенерировать секретный ключ"
-            CHECKS+=("${RED}[FAIL]${NC} MTProto Proxy $MTPROTO_IMPLEMENTATION (ошибка генерации секрета)")
+            MTPROTO_STATE="failed"
+            add_result "FAIL" "MTProto Proxy" "$MTPROTO_IMPLEMENTATION: не удалось сгенерировать секрет"
         fi
     else
         log "Установка MTProto Proxy пропущена"
+        add_result "SKIP" "MTProto Proxy" "пользователь отказался от установки"
     fi
 else
+    MTPROTO_STATE="unavailable"
     warn "Docker недоступен, пропускаем установку MTProto Proxy"
+    add_result "SKIP" "MTProto Proxy" "Docker daemon недоступен"
 fi
 
 # ФИНАЛЬНЫЙ ОТЧЕТ С MTPROTO
@@ -1531,8 +1813,12 @@ echo "----------------"
 for check in "${CHECKS[@]}"; do
     echo -e "  $check"
 done
+echo ""
+echo "Опциональные компоненты:"
+echo "  Docker: $DOCKER_STATE"
+echo "  MTProto: $MTPROTO_STATE${MTPROTO_IMPLEMENTATION:+ ($MTPROTO_IMPLEMENTATION)}"
 # Информация о MTProto в финальном отчете
-if docker ps | grep -q mtproto-proxy 2>/dev/null; then
+if [ "$DOCKER_STATE" = "installed-running" ] && docker ps --format '{{.Names}}' 2>/dev/null | grep -qx mtproto-proxy; then
     # Пытаемся получить секрет из сохранённого файла или из логов
     MTPROTO_SECRET=""
     if [ -f /tmp/mtproto_secret.txt ]; then
