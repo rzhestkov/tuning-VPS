@@ -596,6 +596,11 @@ ssh_effective_has() {
     sshd -T 2>/dev/null | grep -qx "$expected"
 }
 
+ssh_effective_has_regex() {
+    local expected_regex=$1
+    sshd -T 2>/dev/null | grep -Eq "$expected_regex"
+}
+
 active_sshd_ports() {
     ss -tlnp 2>/dev/null | awk '/sshd/ {print $4}' | sed 's/.*://' | sort -nu | tr '\n' ' '
 }
@@ -762,7 +767,7 @@ write_managed_sshd_config() {
 validate_managed_ssh_effective() {
     local permit_root=$1
     local keep_port_22=$2
-    local expected
+    local expected ok=true
     local -a expected_settings=(
         "passwordauthentication no"
         "kbdinteractiveauthentication no"
@@ -779,19 +784,36 @@ validate_managed_ssh_effective() {
         "allowagentforwarding no"
         "permitemptypasswords no"
         "printmotd no"
-        "subsystem sftp internal-sftp"
     )
 
-    ssh_effective_has "port $SSH_PORT" || return 1
+    if ! ssh_effective_has "port $SSH_PORT"; then
+        error "Ожидалась фактическая SSH-директива: port $SSH_PORT"
+        ok=false
+    fi
+
     if [ "$keep_port_22" = true ]; then
-        ssh_effective_has "port 22" || return 1
+        if ! ssh_effective_has "port 22"; then
+            error "Ожидалась фактическая SSH-директива: port 22"
+            ok=false
+        fi
     elif ssh_effective_has "port 22"; then
-        return 1
+        error "Фактическая SSH-конфигурация всё ещё содержит port 22"
+        ok=false
     fi
 
     for expected in "${expected_settings[@]}"; do
-        ssh_effective_has "$expected" || return 1
+        if ! ssh_effective_has "$expected"; then
+            error "Ожидалась фактическая SSH-директива: $expected"
+            ok=false
+        fi
     done
+
+    if ! ssh_effective_has_regex '^subsystem[[:space:]]+sftp[[:space:]]+internal-sftp[[:space:]]*$'; then
+        error "Ожидалась фактическая SSH-директива: subsystem sftp internal-sftp"
+        ok=false
+    fi
+
+    [ "$ok" = true ]
 }
 
 if ! ssh_port_listening 22; then
