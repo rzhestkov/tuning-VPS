@@ -12,8 +12,12 @@ GITHUB_USER="rzhestkov"
 REPO_NAME="tuning-VPS"
 SSH_KEY_URL="https://raw.githubusercontent.com/${GITHUB_USER}/${REPO_NAME}/main/ssh/authorized_keys"
 
-# Получение IP сервера (один раз в начале скрипта)
-SERVER_IP=$(curl -s --max-time 5 ifconfig.me 2>/dev/null || hostname -I | awk '{print $1}')
+# Получение IPv4 сервера (один раз в начале скрипта)
+SERVER_IP=$(
+    curl -4 -fsS --max-time 5 ifconfig.me 2>/dev/null ||
+    ip -4 route get 1.1.1.1 2>/dev/null | awk '/src/ {for (i=1; i<=NF; i++) if ($i=="src") {print $(i+1); exit}}' ||
+    hostname -I | tr ' ' '\n' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -n 1
+)
 
 # Цвета для вывода
 RED='\033[0;31m'
@@ -379,6 +383,11 @@ net.ipv4.tcp_synack_retries = 2
 # Отключение IP forwarding (если не нужен)
 net.ipv4.ip_forward = 0
 
+# IPv6 не используется в этой конфигурации: уменьшаем поверхность атаки.
+net.ipv6.conf.all.disable_ipv6 = 1
+net.ipv6.conf.default.disable_ipv6 = 1
+net.ipv6.conf.lo.disable_ipv6 = 1
+
 # Ограничение ICMP
 net.ipv4.icmp_echo_ignore_all = 0
 net.ipv4.icmp_echo_ignore_broadcasts = 1
@@ -588,7 +597,7 @@ fi
 
 ssh_port_listening() {
     local port=$1
-    ss -tlnp 2>/dev/null | grep -qE ":${port}([[:space:]]|$)"
+    ss -4 -tlnp 2>/dev/null | grep -qE ":${port}([[:space:]]|$)"
 }
 
 ssh_effective_has() {
@@ -602,7 +611,7 @@ ssh_effective_has_regex() {
 }
 
 active_sshd_ports() {
-    ss -tlnp 2>/dev/null | awk '/sshd/ {print $4}' | sed 's/.*://' | sort -nu | tr '\n' ' '
+    ss -4 -tlnp 2>/dev/null | awk '/sshd/ {print $4}' | sed 's/.*://' | sort -nu | tr '\n' ' '
 }
 
 detect_current_ssh_port() {
@@ -730,6 +739,7 @@ write_managed_sshd_config() {
             echo "# Временный порт до ручной проверки подключения"
             echo "Port 22"
         fi
+        echo "AddressFamily inet"
         echo ""
         echo "PasswordAuthentication no"
         echo "KbdInteractiveAuthentication no"
@@ -770,6 +780,7 @@ validate_managed_ssh_effective() {
     local expected ok=true
     local -a expected_settings=(
         "passwordauthentication no"
+        "addressfamily inet"
         "kbdinteractiveauthentication no"
         "pubkeyauthentication yes"
         "authorizedkeysfile .ssh/authorized_keys"
@@ -949,6 +960,15 @@ apt-get install -y -qq ufw
 # Отключаем UFW перед настройкой (если был включен), чтобы избежать блокировки
 ufw disable 2>/dev/null || true
 
+# В этой конфигурации используется только IPv4. UFW не должен создавать v6-правила.
+if [ -f /etc/default/ufw ]; then
+    if grep -q '^IPV6=' /etc/default/ufw; then
+        sed -i 's/^IPV6=.*/IPV6=no/' /etc/default/ufw
+    else
+        echo 'IPV6=no' >> /etc/default/ufw
+    fi
+fi
+
 # Политики по умолчанию
 ufw default deny incoming
 ufw default allow outgoing
@@ -1007,10 +1027,12 @@ fi
 if [ "$SSH_VALIDATION_PASSED" != true ]; then
     error "Автоматические проверки перед контрольным входом не пройдены."
     warn "Порт 22 и временный вход root сохранены."
+    error "SSH-hardening не завершён. Дальнейшая настройка остановлена."
     add_check 1 "Контрольный вход SSH (автоматические проверки)"
+    exit 1
 else
     warn "Перед продолжением обязательно проверьте вход в НОВОМ окне:"
-    warn "ssh -p $SSH_PORT $NEW_USER@$SERVER_IP"
+    warn "ssh -4 -p $SSH_PORT $NEW_USER@$SERVER_IP"
     warn "Не закрывайте текущую root-сессию."
     confirm=""
 
@@ -1019,6 +1041,7 @@ else
     else
         warn "Нет интерактивного терминала для контрольного подтверждения."
         warn "SSH-hardening остановлен: порт 22 и временный вход root сохранены."
+        error "Дальнейшая настройка остановлена до ручного подтверждения входа по ключу."
     fi
 
     case "$confirm" in
@@ -1068,11 +1091,14 @@ else
                 error "Ошибка финального этапа. Выполняется полный откат."
                 restore_ssh_access
                 add_check 1 "Финальная SSH-конфигурация (выполнен откат)"
+                exit 1
             fi
             ;;
         *)
             warn "Подтверждение не получено. Порт 22 и временный вход root сохранены."
+            error "SSH-hardening не завершён. Дальнейшая настройка остановлена."
             add_check 1 "Финальная SSH-конфигурация (отложена)"
+            exit 1
             ;;
     esac
 fi
@@ -1603,7 +1629,7 @@ echo -e "  SSH порт:        ${GREEN}$SSH_PORT${NC}"
 echo -e "  Пользователь:    ${GREEN}$NEW_USER${NC}"
 echo ""
 echo "Команда для подключения:"
-echo -e "${YELLOW}  ssh -p $SSH_PORT $NEW_USER@$SERVER_IP${NC}"
+echo -e "${YELLOW}  ssh -4 -p $SSH_PORT $NEW_USER@$SERVER_IP${NC}"
 echo ""
 echo "Если что-то не работает:"
 echo "  1. Проверьте статус SSH: sudo systemctl status ssh"
