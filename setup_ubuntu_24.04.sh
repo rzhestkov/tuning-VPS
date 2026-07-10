@@ -596,6 +596,49 @@ ssh_effective_has() {
     sshd -T 2>/dev/null | grep -qx "$expected"
 }
 
+active_sshd_ports() {
+    ss -tlnp 2>/dev/null | awk '/sshd/ {print $4}' | sed 's/.*://' | sort -nu | tr '\n' ' '
+}
+
+detect_current_ssh_port() {
+    local port pid ppid socket_line
+
+    if [ -n "${SSH_CONNECTION:-}" ]; then
+        port=$(awk 'NF >= 4 {print $4}' <<< "$SSH_CONNECTION")
+        if [[ "$port" =~ ^[0-9]+$ ]]; then
+            printf '%s\n' "$port"
+            return 0
+        fi
+    fi
+
+    if [ -n "${SSH_CLIENT:-}" ]; then
+        port=$(awk 'NF >= 3 {print $3}' <<< "$SSH_CLIENT")
+        if [[ "$port" =~ ^[0-9]+$ ]]; then
+            printf '%s\n' "$port"
+            return 0
+        fi
+    fi
+
+    pid=$$
+    while [ -n "$pid" ] && [ "$pid" -gt 1 ] 2>/dev/null; do
+        socket_line=$(ss -tnpH 2>/dev/null | awk -v pid="$pid" '$0 ~ ("pid=" pid ",") {print; exit}')
+        if [ -n "$socket_line" ]; then
+            port=$(awk '{print $4}' <<< "$socket_line" | sed -E 's/.*:([0-9]+)$/\1/')
+            if [[ "$port" =~ ^[0-9]+$ ]]; then
+                printf '%s\n' "$port"
+                return 0
+            fi
+        fi
+
+        ppid=$(ps -o ppid= -p "$pid" 2>/dev/null | awk '{print $1}')
+        [ -n "$ppid" ] || break
+        [ "$ppid" != "$pid" ] || break
+        pid=$ppid
+    done
+
+    return 1
+}
+
 ssh_include_has_conflict() {
     local include_file=$1
     local depth=${2:-0}
@@ -756,19 +799,23 @@ if ! ssh_port_listening 22; then
     exit 1
 fi
 log "Исходный SSH-порт 22 слушается."
-log "Другие активные SSH-порты: $(ss -tlnp 2>/dev/null | awk '/sshd/ {print $4}' | sed 's/.*://' | sort -nu | grep -vx 22 | tr '\n' ' ' || true)"
+ACTIVE_SSH_PORTS=$(active_sshd_ports)
+OTHER_ACTIVE_SSH_PORTS=$(printf '%s\n' "$ACTIVE_SSH_PORTS" | tr ' ' '\n' | grep -vx 22 | tr '\n' ' ' || true)
+log "Другие активные SSH-порты: $OTHER_ACTIVE_SSH_PORTS"
 
-if [ -n "${SSH_CONNECTION:-}" ]; then
-    CURRENT_SSH_PORT=$(awk '{print $4}' <<< "$SSH_CONNECTION")
+if CURRENT_SSH_PORT=$(detect_current_ssh_port); then
     if [ "$CURRENT_SSH_PORT" != "22" ]; then
         error "Текущая SSH-сессия подключена не к порту 22, а к порту $CURRENT_SSH_PORT."
         error "Остановка до изменения конфигурации."
         exit 1
     fi
     log "Подтверждено: текущая SSH-сессия использует порт 22."
+elif [ -z "$OTHER_ACTIVE_SSH_PORTS" ]; then
+    warn "Не удалось точно определить порт текущей SSH-сессии: SSH_CONNECTION/SSH_CLIENT отсутствуют, сокет процесса не найден."
+    warn "Такое бывает после запуска через sudo/su. Порт 22 слушается и других SSH-портов не обнаружено, продолжаем."
 else
-    error "Не удалось подтвердить порт текущей сессии: переменная SSH_CONNECTION отсутствует."
-    error "Запустите скрипт из root SSH-сессии на порту 22."
+    error "Не удалось подтвердить порт текущей SSH-сессии, а кроме 22 обнаружены другие SSH-порты: $OTHER_ACTIVE_SSH_PORTS"
+    error "Запустите скрипт из root SSH-сессии на порту 22 или сохраните SSH_CONNECTION/SSH_CLIENT при sudo/su."
     exit 1
 fi
 
