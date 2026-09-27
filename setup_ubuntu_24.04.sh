@@ -46,11 +46,53 @@ error() {
     echo -e "${RED}[ОШИБКА]${NC} $1"
 }
 
-# Функция проверки существования UFW правила
+# UFW выводим в C locale: дальнейшие проверки не должны зависеть от языка VPS.
+# Функция ищет только IPv4 allow rule, а не похожее IPv6-правило.
 ufw_rule_exists() {
     local port=$1
-    LC_ALL=C ufw status | awk '{print $1}' | grep -qx "$port"
-    return $?
+    LC_ALL=C ufw status 2>/dev/null |
+        awk -v port="$port" '$1 == port && $2 == "ALLOW" && $3 == "IN" && $0 !~ /\(v6\)/ { found=1 } END { exit !found }'
+}
+
+# Базовый сценарий владеет только своим SSH-правилом. Другие allow rules могут
+# принадлежать хостеру или приложению, поэтому их нельзя удалять автоматически.
+ufw_unexpected_ipv4_allow_rules() {
+    LC_ALL=C ufw status 2>/dev/null |
+        awk -v ssh_port="$SSH_PORT/tcp" '
+            $2 == "ALLOW" && $3 == "IN" && $0 !~ /\(v6\)/ && $1 != ssh_port { print }
+        '
+}
+
+report_ufw_unexpected_rules() {
+    local rules count
+    rules=$(ufw_unexpected_ipv4_allow_rules)
+    count=$(awk 'NF { count++ } END { print count + 0 }' <<< "$rules")
+    if [ "$count" -gt 0 ]; then
+        warn "Обнаружены $count внешних IPv4 allow-правил UFW; базовый скрипт их не изменял:"
+        printf '%s\n' "$rules"
+        add_result "WARN" "UFW" "сохранены $count внешних IPv4 allow-правил"
+    else
+        add_result "OK" "UFW" "активен; базовое входящее правило только для SSH $SSH_PORT/tcp"
+    fi
+}
+
+# Docker публикует порты напрямую через firewall backend и может обойти UFW.
+# Выводятся только имена контейнеров и опубликованные порты, без логов/секретов.
+report_docker_network_exposure() {
+    local published count
+    if ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then
+        return 0
+    fi
+    published=$(docker ps --format '{{.Names}} {{.Ports}}' |
+        awk '/0\.0\.0\.0:|\[::\]:|:::/ { print }')
+    count=$(awk 'NF { count++ } END { print count + 0 }' <<< "$published")
+    if [ "$count" -gt 0 ]; then
+        warn "Docker публикует порты наружу; UFW может не ограничивать эти подключения:"
+        printf '%s\n' "$published"
+        add_result "WARN" "Docker network" "$count контейнер(ов) публикуют порты; проверьте bind и DOCKER-USER"
+    else
+        add_result "OK" "Docker network" "внешние опубликованные порты контейнеров не обнаружены"
+    fi
 }
 
 # Функции добавления результатов проверки
@@ -744,6 +786,8 @@ SSH_ORIGINAL_UFW=false
 SSH_ORIGINAL_UFW_DEFAULT=false
 SSH_ORIGINAL_UFW_RULES=false
 SSH_ORIGINAL_UFW6_RULES=false
+UFW_TEMP_RULE_CREATED=false
+UFW_22_RULE_PREEXISTED=false
 
 # На ошибке возвращаем исходные файлы, состояние firewall и systemd. Если
 # проверка восстановления не прошла, сохраняем копии для консоли хостера.
@@ -945,8 +989,8 @@ if [ "$SSH_ACCESS_MODE" = transition ]; then
     warn "Оставьте текущую административную сессию открытой до окончания контрольного входа."
 fi
 
-# Firewall готовим перед перезапуском SSH. Сначала разрешаем старый и новый
-# порт, затем включаем deny incoming; UFW не выключается во время перехода.
+# Firewall готовим перед перезапуском SSH. Базовый сценарий добавляет только
+# SSH, не отключает UFW и не меняет сторонние правила хостера/приложений.
 if ! command -v ufw >/dev/null 2>&1; then
     apt-get install -y -qq ufw || { error "Не удалось установить UFW"; exit 1; }
 fi
@@ -976,9 +1020,21 @@ if [ -f /etc/default/ufw ]; then
         printf '\nIPV6=no\n' >> /etc/default/ufw
     fi
 fi
-ufw allow "$SSH_PORT/tcp" comment 'SSH Custom Port' || exit 1
+# Запоминаем владельца правила до добавления: на повторном запуске нельзя
+# считать совпадающее правило своим и позже удалить настройку хостера.
+if ufw_rule_exists "$SSH_PORT/tcp"; then
+    warn "Правило UFW для $SSH_PORT/tcp уже существовало; оставляем его без изменений."
+else
+    ufw allow "$SSH_PORT/tcp" comment 'tuning-VPS SSH' || exit 1
+fi
 if [ "$SSH_ACCESS_MODE" = transition ]; then
-    ufw allow 22/tcp comment 'SSH Temporary Legacy Port' || exit 1
+    if ufw_rule_exists '22/tcp'; then
+        UFW_22_RULE_PREEXISTED=true
+        warn "Правило UFW для 22/tcp уже существовало; оно не будет удалено скриптом."
+    else
+        ufw allow 22/tcp comment 'tuning-VPS temporary SSH' || exit 1
+        UFW_TEMP_RULE_CREATED=true
+    fi
 fi
 ufw default deny incoming || exit 1
 ufw --force enable || exit 1
@@ -1076,28 +1132,31 @@ if [ "$SSH_ACCESS_MODE" = transition ] ||
     esac
 fi
 
-# Блокировка пароля root выполняется последней. Удаляем разрешение 22 в UFW
-# только после подтверждённого входа и проверенного финального listener.
+# Блокировка пароля root выполняется последней. Удаляем только временное
+# правило 22, созданное этим запуском; правило, существовавшее раньше, остаётся
+# и будет явно показано в отчёте как внешнее.
 if ! passwd -S root 2>/dev/null | awk '{print $2}' | grep -q '^L'; then
     SSH_ROOT_TOUCHED=true
     passwd -l root >/dev/null 2>&1 || exit 1
 fi
 passwd -S root 2>/dev/null | awk '{print $2}' | grep -q '^L' || exit 1
-for attempt in 1 2 3 4 5; do
-    ufw_rule_exists '22/tcp' || break
+if [ "$UFW_TEMP_RULE_CREATED" = true ]; then
     ufw --force delete allow 22/tcp >/dev/null || exit 1
-done
-if ufw_rule_exists '22/tcp'; then
-    error "В UFW осталось разрешение порта 22."
-    exit 1
+    if ufw_rule_exists '22/tcp'; then
+        error "Не удалось удалить временное правило UFW для порта 22."
+        exit 1
+    fi
+elif [ "$UFW_22_RULE_PREEXISTED" = true ]; then
+    warn "Внешнее правило UFW для 22/tcp сохранено; SSH на этом порту уже не слушает."
 fi
 LC_ALL=C ufw status | grep -q '^Status: active' && ufw_rule_exists "$SSH_PORT/tcp" ||
     { error "Финальное состояние UFW не подтверждено"; exit 1; }
+report_ufw_unexpected_rules
 SSH_COMMITTED=true
 SSH_ROLLBACK_NEEDED=false
 trap - EXIT INT TERM
 rm -rf -- "$SSH_WORK"
-add_check 0 "Финальная SSH-конфигурация, ключи и UFW"
+add_check 0 "Финальная SSH-конфигурация и ключи"
 
 # 12. НАСТРОЙКА FAIL2BAN (ЗАЩИTA SSH ОТ БРУТФОРСА) ============================
 
@@ -1701,10 +1760,9 @@ if [ "$DOCKER_STATE" = "not-installed" ]; then
         log "Установка Docker..."
         DOCKER_INSTALL_OK=true
 
-        # Удаляем старые версии
-        apt-get remove -y docker docker-engine docker.io containerd runc 2>/dev/null || true
-
-        # Установка зависимостей
+        # Не удаляем пакеты Docker/containerd автоматически: они могут
+        # принадлежать уже работающему приложению. Конфликт установки должен
+        # завершиться явной ошибкой, а не скрытой миграцией.
         apt-get install -y -qq ca-certificates curl gnupg || DOCKER_INSTALL_OK=false
 
         # Добавление репозитория Docker
@@ -1750,11 +1808,9 @@ if [ "$DOCKER_STATE" = "not-installed" ]; then
     fi
 else
     if [ "$DOCKER_STATE" = "installed-stopped" ]; then
-        systemctl start docker 2>/dev/null || true
-        sleep 2
-        detect_docker_state
-    fi
-    if [ "$DOCKER_STATE" = "installed-running" ]; then
+        warn "Docker установлен, но daemon остановлен; не запускаем его без явного запроса."
+        add_result "WARN" "Docker" "установлен, но daemon остановлен"
+    elif [ "$DOCKER_STATE" = "installed-running" ]; then
         log "Docker уже установлен и запущен"
         add_result "OK" "Docker" "уже был установлен и доступен"
     else
@@ -1762,6 +1818,13 @@ else
         add_result "WARN" "Docker" "установлен, но daemon недоступен"
     fi
 fi
+
+# UFW видит обычные процессы, но Docker может добавлять собственные firewall
+# правила. Перед установкой приложений показываем только факт публикации портов.
+if [ "$DOCKER_STATE" = "installed-running" ]; then
+    report_docker_network_exposure
+fi
+
 # 22. УСТАНОВКА MTPROTO PROXY (ОПЦИОНАЛЬНО)
 
 # MTProto можно устанавливать только через проверенный работающий Docker daemon.
