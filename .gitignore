@@ -1,0 +1,19 @@
+# Tipical gitignore for Powershel projects
+# All by default
+*
+# include
+!/*.sh
+!/*.md
+!/.gitignore
+# tests, do not publish
+/tests/
+#!/tests/
+#!/tests/integration/
+#!/tests/integration/*.sh
+#!/tests/integration/*.py
+#!/tests/integration/*.md
+
+# local Codex/agent briefing, do not publish
+AGENTS.md
+#vps list, do not publish
+vps_list.md

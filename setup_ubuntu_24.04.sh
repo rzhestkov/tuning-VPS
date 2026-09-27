@@ -32,7 +32,6 @@ declare -a CHECKS
 DOCKER_STATE="not-installed"
 MTPROTO_STATE="not-requested"
 MTPROTO_IMPLEMENTATION=""
-SSH_KEYS_READY=false
 
 # Функция логирования
 log() {
@@ -50,7 +49,7 @@ error() {
 # Функция проверки существования UFW правила
 ufw_rule_exists() {
     local port=$1
-    ufw status | awk '{print $1}' | grep -qx "$port"
+    LC_ALL=C ufw status | awk '{print $1}' | grep -qx "$port"
     return $?
 }
 
@@ -176,16 +175,6 @@ check_service() {
     return 0
 }
 
-authorized_keys_ed25519_only() {
-    local file=$1
-    awk '
-        /^[[:space:]]*($|#)/ { next }
-        $1 == "ssh-ed25519" { found=1; next }
-        { invalid=1 }
-        END { exit !(found && !invalid) }
-    ' "$file" 2>/dev/null
-}
-
 file_contains() {
     local file=$1
     local pattern=$2
@@ -236,6 +225,90 @@ if ! curl -s --head "$SSH_KEY_URL" | head -n 1 | grep -q "200\|301\|302"; then
     error "URL: $SSH_KEY_URL"
     exit 1
 fi
+
+# SSH проверяется до обновления пакетов и любых правок: повторный запуск на уже
+# защищённом сервере не должен сначала что-то изменить, а потом требовать порт 22.
+SSHD_CONFIG=/etc/ssh/sshd_config
+SSH_MANAGED_CONFIG=/etc/ssh/tuning-vps.conf
+ssh_port_listening() {
+    ss -4 -H -ltn 2>/dev/null | awk -v port="$1" '
+        { endpoint=$4; sub(/^.*:/, "", endpoint); if (endpoint == port) found=1 }
+        END { exit !found }
+    '
+}
+ssh_service_port_listening() {
+    # После переключения на ssh.service порт должен принадлежать самому sshd,
+    # а не постороннему процессу с тем же номером.
+    ss -4 -H -ltnp 2>/dev/null | awk -v port="$1" '
+        { endpoint=$4; sub(/^.*:/, "", endpoint); if (endpoint == port && /"sshd"/) found=1 }
+        END { exit !found }
+    '
+}
+ssh_context_value() {
+    local user=$1 port=$2 option=$3
+    sshd -T -C "user=$user,host=${SSH_CLIENT_ADDR:-127.0.0.1},addr=${SSH_CLIENT_ADDR:-127.0.0.1},lport=$port" 2>/dev/null |
+        awk -v option="$option" '$1 == option { print $2; exit }'
+}
+ssh_effective_port() {
+    sshd -T 2>/dev/null | awk -v port="$1" '$1 == "port" && $2 == port { found=1 } END { exit !found }'
+}
+detect_current_ssh_port() {
+    local port pid ppid socket_line
+    if [ -n "${SSH_CONNECTION:-}" ]; then
+        port=$(awk 'NF >= 4 {print $4}' <<< "$SSH_CONNECTION")
+        [[ "$port" =~ ^[0-9]+$ ]] && { printf '%s\n' "$port"; return 0; }
+    fi
+    if [ -n "${SSH_CLIENT:-}" ]; then
+        port=$(awk 'NF >= 3 {print $3}' <<< "$SSH_CLIENT")
+        [[ "$port" =~ ^[0-9]+$ ]] && { printf '%s\n' "$port"; return 0; }
+    fi
+    # sudo/su часто очищает SSH_*; пытаемся найти сокет родительского sshd.
+    pid=$$
+    while [ -n "$pid" ] && [ "$pid" -gt 1 ] 2>/dev/null; do
+        socket_line=$(ss -tnpH 2>/dev/null | awk -v pid="$pid" '$0 ~ ("pid=" pid ",") {print; exit}')
+        port=$(awk '{print $4}' <<< "$socket_line" | sed -nE 's/.*:([0-9]+)$/\1/p')
+        [[ "$port" =~ ^[0-9]+$ ]] && { printf '%s\n' "$port"; return 0; }
+        ppid=$(ps -o ppid= -p "$pid" 2>/dev/null | awk '{print $1}')
+        [ -n "$ppid" ] && [ "$ppid" != "$pid" ] || break
+        pid=$ppid
+    done
+    return 1
+}
+
+if [ ! -f "$SSHD_CONFIG" ] || ! sshd -t >/dev/null 2>&1; then
+    error "Исходная SSH-конфигурация отсутствует или не проходит sshd -t."
+    exit 1
+fi
+SSH_CLIENT_ADDR=$(awk 'NF >= 1 {print $1}' <<< "${SSH_CONNECTION:-${SSH_CLIENT:-}}")
+[[ "$SSH_CLIENT_ADDR" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || SSH_CLIENT_ADDR=127.0.0.1
+if CURRENT_SSH_PORT=$(detect_current_ssh_port); then
+    if [ "$CURRENT_SSH_PORT" != 22 ] && [ "$CURRENT_SSH_PORT" != "$SSH_PORT" ]; then
+        error "Текущая SSH-сессия использует порт $CURRENT_SSH_PORT; ожидаются 22 или $SSH_PORT."
+        exit 1
+    fi
+else
+    if ssh_port_listening 22 && ssh_port_listening "$SSH_PORT"; then
+        error "Порт текущей SSH-сессии не определён при двух активных портах."
+        error "Запустите из SSH-сессии с сохранённым SSH_CONNECTION или используйте консоль хостера."
+        exit 1
+    fi
+    warn "Порт текущей SSH-сессии не определён; проверяем единственный IPv4 listener."
+fi
+if ssh_port_listening 22; then
+    SSH_ACCESS_MODE=transition
+elif ssh_port_listening "$SSH_PORT" &&
+     ssh_effective_port "$SSH_PORT" && ! ssh_effective_port 22 &&
+     [ "$(ssh_context_value root "$SSH_PORT" permitrootlogin)" = no ] &&
+     [ "$(ssh_context_value "$NEW_USER" "$SSH_PORT" passwordauthentication)" = no ] &&
+     [ "$(ssh_context_value "$NEW_USER" "$SSH_PORT" kbdinteractiveauthentication)" = no ] &&
+     [ "$(ssh_context_value "$NEW_USER" "$SSH_PORT" pubkeyauthentication)" = yes ]; then
+    SSH_ACCESS_MODE=final
+else
+    error "SSH не находится ни в исходном состоянии с портом 22, ни в проверенном финальном состоянии."
+    error "Конфигурация оставлена без изменений; нужна диагностика доступа через консоль хостера."
+    exit 1
+fi
+log "Обнаружено состояние SSH: $SSH_ACCESS_MODE"
 
 # 02. ОБНОВЛЕНИЕ СИСТЕМЫ =======================================================
 
@@ -461,19 +534,22 @@ else
     fi
 fi
 
-# Настраиваем sudo без пароля только если пользователь был создан
-if [ "$USER_CREATED" = true ]; then
-    log "Настройка sudo без пароля..."
-    echo "$NEW_USER ALL=(ALL:ALL) NOPASSWD: ALL" > /etc/sudoers.d/99-$NEW_USER
-    chmod 440 /etc/sudoers.d/99-$NEW_USER
-    
-    # Проверка валидности sudoers файла через visudo (пункт 32)
-    visudo -c -f /etc/sudoers.d/99-$NEW_USER || {
-        error "Невалидный sudoers файл!"
-        rm -f /etc/sudoers.d/99-$NEW_USER
-        exit 1
-    }
+# Администрирование должно работать и при повторном запуске для уже существующего
+# пользователя. Непроверенный sudo нельзя оставлять до отключения root-входа.
+usermod -aG sudo "$NEW_USER" || { error "Не удалось назначить sudo пользователю $NEW_USER"; exit 1; }
+SUDOERS_FILE="/etc/sudoers.d/99-$NEW_USER"
+SUDOERS_NEW=$(mktemp)
+printf '%s ALL=(ALL:ALL) NOPASSWD: ALL\n' "$NEW_USER" > "$SUDOERS_NEW"
+chmod 440 "$SUDOERS_NEW"
+if ! visudo -c -f "$SUDOERS_NEW" >/dev/null 2>&1; then
+    rm -f "$SUDOERS_NEW"
+    error "Не прошла проверка sudoers для $NEW_USER"
+    exit 1
 fi
+if ! cmp -s "$SUDOERS_NEW" "$SUDOERS_FILE"; then
+    install -m 0440 "$SUDOERS_NEW" "$SUDOERS_FILE" || exit 1
+fi
+rm -f "$SUDOERS_NEW"
 
 
 USER_VALIDATION_OK=0
@@ -487,6 +563,10 @@ if [ -f "/etc/sudoers.d/99-$NEW_USER" ] && ! visudo -c -f /etc/sudoers.d/99-$NEW
     USER_VALIDATION_OK=1
 fi
 add_check $USER_VALIDATION_OK "Пользователь $NEW_USER и sudo"
+if [ "$USER_VALIDATION_OK" -ne 0 ] || ! su - "$NEW_USER" -c 'sudo -n true' >/dev/null 2>&1; then
+    error "Административный доступ $NEW_USER через sudo не подтверждён."
+    exit 1
+fi
 
 # 07. ОГРАНИЧЕНИЯ ДЛЯ ПОЛЬЗОВАТЕЛЯ (LIMITS.CONF) ==============================
 
@@ -536,574 +616,488 @@ else
     add_result "FAIL" "Limits" "$LIMITS_FAILURE; исходный limits.conf восстановлен"
 fi
 
-# 08. НАСТРОЙКА SSH КЛЮЧЕЙ =====================================================
+# 08–11. SSH: ключи, безопасный переход, UFW и подтверждение входа ============
 
-log "Настройка SSH ключей..."
+# Провайдерский sshd_config и его Include остаются на месте. Управляемый файл
+# подключается первым: sshd берёт первое значение большинства директив. Port
+# добавляется к списку, поэтому итог обязательно проверяется через sshd -T.
+ssh_effective_has() {
+    sshd -T 2>/dev/null | grep -qx "$1"
+}
+ssh_candidate_value() {
+    local config=$1 user=$2 port=$3 option=$4 addr=${5:-$SSH_CLIENT_ADDR}
+    sshd -T -f "$config" -C "user=$user,host=$addr,addr=$addr,lport=$port" 2>/dev/null |
+        awk -v option="$option" '$1 == option {print $2; exit}'
+}
+ssh_candidate_port() {
+    sshd -T -f "$1" 2>/dev/null |
+        awk -v port="$2" '$1 == "port" && $2 == port {found=1} END {exit !found}'
+}
+report_ssh_conflict() {
+    local file
+    error "Конфликтующие SSH-директивы; проверьте источник ниже:"
+    for file in /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf; do
+        [ -f "$file" ] || continue
+        grep -HniE '^[[:space:]]*(Include|Match|Port|ListenAddress|AddressFamily|PermitRootLogin|PasswordAuthentication|KbdInteractiveAuthentication|HostbasedAuthentication|GSSAPIAuthentication|PubkeyAuthentication|PubkeyAcceptedAlgorithms|AuthorizedKeysFile|AuthorizedKeysCommand|AuthenticationMethods|AllowUsers|DenyUsers)([[:space:]]|=)' "$file" || true
+    done
+}
+ssh_unsafe_match_auth() {
+    local file findings
+    for file in /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf; do
+        [ -f "$file" ] || continue
+        findings=$(awk '
+            tolower($1) == "match" { in_match=1; next }
+            in_match && tolower($1) ~ /^(permitrootlogin|passwordauthentication|kbdinteractiveauthentication|hostbasedauthentication|gssapiauthentication|pubkeyauthentication|pubkeyacceptedalgorithms|authorizedkeysfile|authorizedkeyscommand|authenticationmethods)$/ {
+                print FILENAME ":" FNR ":" $0
+            }
+        ' "$file")
+        if [ -n "$findings" ]; then
+            error "Провайдерские Match меняют аутентификацию; нужен ручной разбор:"
+            printf '%s\n' "$findings"
+            return 0
+        fi
+    done
+    return 1
+}
+ssh_candidate_valid() {
+    local config=$1 phase=$2 option before after addr
+    sshd -t -f "$config" || return 1
+    ssh_candidate_port "$config" "$SSH_PORT" || return 1
+    [ "$(ssh_candidate_value "$config" "$NEW_USER" "$SSH_PORT" addressfamily)" = inet ] || return 1
+    [ "$(ssh_candidate_value "$config" "$NEW_USER" "$SSH_PORT" pubkeyauthentication)" = yes ] || return 1
+    if [ "$phase" = temporary ]; then
+        ssh_candidate_port "$config" 22 || return 1
+        # Временный конфиг не меняет способы входа root на исходном порту.
+        for option in permitrootlogin passwordauthentication kbdinteractiveauthentication pubkeyauthentication authorizedkeysfile authenticationmethods; do
+            before=$(ssh_context_value root 22 "$option")
+            after=$(ssh_candidate_value "$config" root 22 "$option")
+            [ "$before" = "$after" ] || { error "Временный SSH меняет root/$option"; return 1; }
+            if ssh_port_listening "$SSH_PORT"; then
+                before=$(ssh_context_value "$NEW_USER" "$SSH_PORT" "$option")
+                after=$(ssh_candidate_value "$config" "$NEW_USER" "$SSH_PORT" "$option")
+                [ "$before" = "$after" ] || { error "Временный SSH меняет $NEW_USER/$option"; return 1; }
+            fi
+        done
+    else
+        ! ssh_candidate_port "$config" 22 || return 1
+        for addr in "$SSH_CLIENT_ADDR" 127.0.0.1 0.0.0.0; do
+            for option in passwordauthentication kbdinteractiveauthentication hostbasedauthentication gssapiauthentication permitemptypasswords; do
+                [ "$(ssh_candidate_value "$config" "$NEW_USER" "$SSH_PORT" "$option" "$addr")" = no ] || return 1
+            done
+            [ "$(ssh_candidate_value "$config" root "$SSH_PORT" permitrootlogin "$addr")" = no ] || return 1
+            [ "$(ssh_candidate_value "$config" "$NEW_USER" "$SSH_PORT" authorizedkeysfile "$addr")" = .ssh/authorized_keys ] || return 1
+            [ "$(ssh_candidate_value "$config" "$NEW_USER" "$SSH_PORT" authorizedkeyscommand "$addr")" = none ] || return 1
+            [ "$(ssh_candidate_value "$config" "$NEW_USER" "$SSH_PORT" pubkeyacceptedalgorithms "$addr")" = ssh-ed25519 ] || return 1
+            case "$(ssh_candidate_value "$config" "$NEW_USER" "$SSH_PORT" authenticationmethods "$addr")" in
+                any|publickey) ;;
+                *) return 1 ;;
+            esac
+        done
+    fi
+}
 
-USER_HOME="/home/$NEW_USER"
-SSH_DIR="$USER_HOME/.ssh"
+# Каждую активную строку проверяет OpenSSH; неизвестные опции и типы ключей
+# не должны попасть в authorized_keys. Комментарии и пустые строки допустимы.
+validate_ed25519_keys() {
+    local source=$1 line keyfile
+    keyfile="$SSH_WORK/keycheck"
+    [ -s "$source" ] || return 1
+    while IFS= read -r line || [ -n "$line" ]; do
+        [[ "$line" =~ ^[[:space:]]*(#|$) ]] && continue
+        [[ "$line" =~ ^ssh-ed25519[[:space:]]+[A-Za-z0-9+/=]+([[:space:]].*)?$ ]] || return 1
+        printf '%s\n' "$line" > "$keyfile"
+        ssh-keygen -lf "$keyfile" 2>/dev/null | grep -q '(ED25519)' || return 1
+    done < "$source"
+    grep -qE '^ssh-ed25519[[:space:]]+' "$source"
+}
 
-mkdir -p "$SSH_DIR"
-chmod 700 "$SSH_DIR"
-
-# Проверка и бэкап существующего authorized_keys
-if [ -f "$SSH_DIR/authorized_keys" ]; then
-    BACKUP_FILE="$SSH_DIR/authorized_keys.bak.$(date +%s)"
-    cp "$SSH_DIR/authorized_keys" "$BACKUP_FILE"
-    warn "Существующий authorized_keys скопирован в: $BACKUP_FILE"
-    warn "ВНИМАНИЕ: SSH ключи будут заменены новыми из GitHub!"
+SSH_HOME=$(getent passwd "$NEW_USER" | cut -d: -f6)
+case "$SSH_HOME" in
+    /*) ;;
+    *) error "У пользователя $NEW_USER нет абсолютного домашнего каталога"; exit 1 ;;
+esac
+if [ "$SSH_HOME" = / ] || [ ! -d "$SSH_HOME" ] || [ -L "$SSH_HOME" ]; then
+    error "Домашний каталог $NEW_USER отсутствует или небезопасен: $SSH_HOME"
+    exit 1
 fi
+SSH_HOME_MODE=$(stat -c '%a' "$SSH_HOME") || exit 1
+if (( (8#$SSH_HOME_MODE & 022) != 0 )); then
+    error "Домашний каталог $SSH_HOME доступен для записи группе или всем."
+    exit 1
+fi
+SSH_WORK=$(mktemp -d /etc/ssh/.tuning-vps.XXXXXXXX) || exit 1
+chmod 700 "$SSH_WORK"
+SSH_DIR=$SSH_HOME/.ssh
+SSH_KEYS=$SSH_DIR/authorized_keys
+SSH_PRIMARY_GROUP=$(id -gn "$NEW_USER") || exit 1
+SSH_CHANGED=false
+SSH_COMMITTED=false
+SSH_ROLLBACK_NEEDED=false
+SSH_CONFIG_TOUCHED=false
+SSH_KEYS_TOUCHED=false
+SSH_SYSTEMD_TOUCHED=false
+SSH_ROOT_TOUCHED=false
+SSH_ORIGINAL_KEYS=false
+SSH_ORIGINAL_DIR=false
+SSH_ORIGINAL_MANAGED=false
+SSH_ORIGINAL_UFW=false
+SSH_ORIGINAL_UFW_DEFAULT=false
+SSH_ORIGINAL_UFW_RULES=false
+SSH_ORIGINAL_UFW6_RULES=false
 
-# Скачиваем ключ с GitHub
-if curl -fsSL "$SSH_KEY_URL" -o "$SSH_DIR/authorized_keys"; then
-    chmod 600 "$SSH_DIR/authorized_keys"
-    chown -R "$NEW_USER:$NEW_USER" "$SSH_DIR"
-    SSH_KEYS_READY=true
-    SSH_KEY_VALIDATION_OK=0
-    if [ ! -s "$SSH_DIR/authorized_keys" ]; then
-        SSH_KEY_VALIDATION_OK=1
+# На ошибке возвращаем исходные файлы, состояние firewall и systemd. Если
+# проверка восстановления не прошла, сохраняем копии для консоли хостера.
+restore_ssh_state() {
+    local failed=false
+    warn "Откат SSH/UFW к состоянию до запуска. Не закрывайте текущую сессию."
+    if [ "$SSH_CONFIG_TOUCHED" = true ]; then
+        cp -p "$SSH_WORK/original-main" "$SSHD_CONFIG" || failed=true
+        if [ "$SSH_ORIGINAL_MANAGED" = true ]; then
+            cp -p "$SSH_WORK/original-managed" "$SSH_MANAGED_CONFIG" || failed=true
+        else
+            rm -f "$SSH_MANAGED_CONFIG" || failed=true
+        fi
     fi
-    if [ "$(stat -c '%a' "$SSH_DIR/authorized_keys" 2>/dev/null)" != "600" ]; then
-        SSH_KEY_VALIDATION_OK=1
+    if [ "$SSH_KEYS_TOUCHED" = true ]; then
+        if [ "$SSH_ORIGINAL_KEYS" = true ]; then
+            cp -p "$SSH_WORK/original-keys" "$SSH_KEYS" || failed=true
+        else
+            rm -f "$SSH_KEYS" || failed=true
+        fi
+        if [ "$SSH_ORIGINAL_DIR" = true ]; then
+            chown "$SSH_DIR_UID:$SSH_DIR_GID" "$SSH_DIR" || failed=true
+            chmod "$SSH_DIR_MODE" "$SSH_DIR" || failed=true
+        else
+            rmdir "$SSH_DIR" 2>/dev/null || true
+        fi
     fi
-    if ! authorized_keys_ed25519_only "$SSH_DIR/authorized_keys"; then
-        SSH_KEY_VALIDATION_OK=1
+    if [ "$SSH_ORIGINAL_UFW" = true ]; then
+        [ "$SSH_ORIGINAL_UFW_DEFAULT" != true ] || cp -p "$SSH_WORK/original-ufw-default" /etc/default/ufw || failed=true
+        [ "$SSH_ORIGINAL_UFW_RULES" != true ] || cp -p "$SSH_WORK/original-ufw-rules" /etc/ufw/user.rules || failed=true
+        [ "$SSH_ORIGINAL_UFW6_RULES" != true ] || cp -p "$SSH_WORK/original-ufw6-rules" /etc/ufw/user6.rules || failed=true
+        if [ "$SSH_UFW_WAS_ACTIVE" = active ]; then
+            ufw reload >/dev/null 2>&1 || failed=true
+        else
+            ufw --force disable >/dev/null 2>&1 || failed=true
+        fi
     fi
-    log "SSH ключ установлен"
-    add_check $SSH_KEY_VALIDATION_OK "Установка SSH ключа"
+    if [ "$SSH_ROOT_TOUCHED" = true ] && [ -n "$SSH_ROOT_HASH_BEFORE" ]; then
+        printf 'root:%s\n' "$SSH_ROOT_HASH_BEFORE" | chpasswd -e >/dev/null 2>&1 || failed=true
+    fi
+    sshd -t >/dev/null 2>&1 || failed=true
+    if [ "$SSH_SYSTEMD_TOUCHED" = true ]; then
+        if [ "$SSH_SOCKET_WAS_ENABLED" = enabled ]; then
+            systemctl enable ssh.socket >/dev/null 2>&1 || failed=true
+        elif [ "$SSH_SOCKET_WAS_ENABLED" = disabled ]; then
+            systemctl disable ssh.socket >/dev/null 2>&1 || failed=true
+        fi
+        if [ "$SSH_SERVICE_WAS_ENABLED" = enabled ]; then
+            systemctl enable ssh.service >/dev/null 2>&1 || failed=true
+        elif [ "$SSH_SERVICE_WAS_ENABLED" = disabled ]; then
+            systemctl disable ssh.service >/dev/null 2>&1 || failed=true
+        fi
+        if [ "$SSH_SOCKET_WAS_ACTIVE" = active ]; then
+            systemctl stop ssh.service >/dev/null 2>&1 || true
+            systemctl start ssh.socket >/dev/null 2>&1 || failed=true
+        else
+            systemctl stop ssh.socket >/dev/null 2>&1 || true
+            systemctl restart ssh.service >/dev/null 2>&1 || failed=true
+        fi
+    fi
+    sleep 2
+    ssh_port_listening "$SSH_ORIGINAL_PORT" || failed=true
+    if [ "$failed" = true ]; then
+        error "Автоматический откат не подтверждён; копии сохранены в $SSH_WORK"
+        return 1
+    fi
+    log "Исходный SSH-порт $SSH_ORIGINAL_PORT снова слушается."
+}
+ssh_exit_handler() {
+    local status=$1
+    trap - EXIT INT TERM
+    if [ "$SSH_ROLLBACK_NEEDED" = true ] && [ "$SSH_COMMITTED" != true ]; then
+        if restore_ssh_state; then
+            rm -rf -- "$SSH_WORK"
+        else
+            status=1
+        fi
+    else
+        rm -rf -- "$SSH_WORK"
+    fi
+    exit "$status"
+}
+trap 'ssh_exit_handler $?' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+# Сначала скачиваем и валидируем весь новый набор ключей. При повторном
+# запуске прежние ключи временно сохраняют доступ до проверки нового набора.
+curl -4 -fsSL --max-time 20 "$SSH_KEY_URL" -o "$SSH_WORK/desired-keys" ||
+    { error "Не удалось скачать SSH-ключи"; exit 1; }
+validate_ed25519_keys "$SSH_WORK/desired-keys" ||
+    { error "В ssh/authorized_keys нужны только действительные ssh-ed25519 ключи"; exit 1; }
+if [ -L "$SSH_DIR" ] || [ -L "$SSH_KEYS" ]; then
+    error "Символические ссылки в .ssh/authorized_keys не поддерживаются."
+    exit 1
+fi
+if [ -d "$SSH_DIR" ]; then
+    SSH_ORIGINAL_DIR=true
+    SSH_DIR_UID=$(stat -c '%u' "$SSH_DIR") || exit 1
+    SSH_DIR_GID=$(stat -c '%g' "$SSH_DIR") || exit 1
+    SSH_DIR_MODE=$(stat -c '%a' "$SSH_DIR") || exit 1
+fi
+if [ -e "$SSH_KEYS" ]; then
+    cp -p "$SSH_KEYS" "$SSH_WORK/original-keys" || exit 1
+    SSH_ORIGINAL_KEYS=true
+    validate_ed25519_keys "$SSH_KEYS" ||
+        { error "Существующий authorized_keys содержит неподдерживаемые ключи"; exit 1; }
+fi
+if [ "$SSH_ORIGINAL_KEYS" = true ]; then
+    cat "$SSH_WORK/original-keys" "$SSH_WORK/desired-keys" |
+        awk '!seen[$0]++' > "$SSH_WORK/staged-keys"
 else
-    error "Не удалось скачать SSH ключ"
-    add_check 1 "Установка SSH ключа"
+    cp "$SSH_WORK/desired-keys" "$SSH_WORK/staged-keys"
+fi
+if [ "$SSH_ORIGINAL_KEYS" != true ] ||
+   ! cmp -s "$SSH_WORK/desired-keys" "$SSH_KEYS" ||
+   [ "$(stat -c '%U:%G %a' "$SSH_KEYS" 2>/dev/null)" != "$NEW_USER:$SSH_PRIMARY_GROUP 600" ] ||
+   [ "$(stat -c '%U:%G %a' "$SSH_DIR" 2>/dev/null)" != "$NEW_USER:$SSH_PRIMARY_GROUP 700" ]; then
+    SSH_CHANGED=true
 fi
 
-# 09. НАСТРОЙКА SSH (ЕДИНЫЙ ОСНОВНОЙ КОНФИГ + ОТКАТ) ===========================
-
-log "Предварительная диагностика SSH..."
-log "${YELLOW}>>> ВАЖНО: Не закрывайте текущую root-сессию до контрольного входа! <<<${NC}"
-
-SSHD_CONFIG="/etc/ssh/sshd_config"
-SSHD_BACKUP_FILE="${SSHD_CONFIG}.bak.$(date +%s)"
-SSH_SAFE_INCLUDES_FILE=$(mktemp)
-SSH_DISABLED_INCLUDES_FILE=$(mktemp)
-ROOT_PASSWORD_WAS_LOCKED=false
-ROOT_PASSWORD_HASH_BEFORE=$(getent shadow root | cut -d: -f2)
+# Готовим оба варианта конфигурации до изменения работающего sshd. Неизвестные
+# провайдерские Port/Match могут конфликтовать; тогда останавливаемся заранее.
+cp -p "$SSHD_CONFIG" "$SSH_WORK/original-main" || exit 1
+if [ -e "$SSH_MANAGED_CONFIG" ]; then
+    cp -p "$SSH_MANAGED_CONFIG" "$SSH_WORK/original-managed" || exit 1
+    SSH_ORIGINAL_MANAGED=true
+fi
+SSH_ORIGINAL_PORT=${CURRENT_SSH_PORT:-22}
+[ "$SSH_ACCESS_MODE" != final ] || SSH_ORIGINAL_PORT=$SSH_PORT
+SSH_ROOT_HASH_BEFORE=$(getent shadow root | cut -d: -f2)
 SSH_SOCKET_WAS_ACTIVE=$(systemctl is-active ssh.socket 2>/dev/null || true)
 SSH_SOCKET_WAS_ENABLED=$(systemctl is-enabled ssh.socket 2>/dev/null || true)
-trap 'rm -f "$SSH_SAFE_INCLUDES_FILE" "$SSH_DISABLED_INCLUDES_FILE"' EXIT
+SSH_SERVICE_WAS_ENABLED=$(systemctl is-enabled ssh.service 2>/dev/null || true)
 
-if passwd -S root 2>/dev/null | awk '{print $2}' | grep -q '^L'; then
-    ROOT_PASSWORD_WAS_LOCKED=true
-fi
-
-ssh_port_listening() {
-    local port=$1
-    ss -4 -tlnp 2>/dev/null | grep -qE ":${port}([[:space:]]|$)"
-}
-
-ssh_effective_has() {
-    local expected=$1
-    sshd -T 2>/dev/null | grep -qx "$expected"
-}
-
-ssh_effective_has_regex() {
-    local expected_regex=$1
-    sshd -T 2>/dev/null | grep -Eq "$expected_regex"
-}
-
-active_sshd_ports() {
-    ss -4 -tlnp 2>/dev/null | awk '/sshd/ {print $4}' | sed 's/.*://' | sort -nu | tr '\n' ' '
-}
-
-detect_current_ssh_port() {
-    local port pid ppid socket_line
-
-    if [ -n "${SSH_CONNECTION:-}" ]; then
-        port=$(awk 'NF >= 4 {print $4}' <<< "$SSH_CONNECTION")
-        if [[ "$port" =~ ^[0-9]+$ ]]; then
-            printf '%s\n' "$port"
-            return 0
-        fi
-    fi
-
-    if [ -n "${SSH_CLIENT:-}" ]; then
-        port=$(awk 'NF >= 3 {print $3}' <<< "$SSH_CLIENT")
-        if [[ "$port" =~ ^[0-9]+$ ]]; then
-            printf '%s\n' "$port"
-            return 0
-        fi
-    fi
-
-    pid=$$
-    while [ -n "$pid" ] && [ "$pid" -gt 1 ] 2>/dev/null; do
-        socket_line=$(ss -tnpH 2>/dev/null | awk -v pid="$pid" '$0 ~ ("pid=" pid ",") {print; exit}')
-        if [ -n "$socket_line" ]; then
-            port=$(awk '{print $4}' <<< "$socket_line" | sed -E 's/.*:([0-9]+)$/\1/')
-            if [[ "$port" =~ ^[0-9]+$ ]]; then
-                printf '%s\n' "$port"
-                return 0
-            fi
-        fi
-
-        ppid=$(ps -o ppid= -p "$pid" 2>/dev/null | awk '{print $1}')
-        [ -n "$ppid" ] || break
-        [ "$ppid" != "$pid" ] || break
-        pid=$ppid
-    done
-
-    return 1
-}
-
-ssh_include_has_conflict() {
-    local include_file=$1
-    local depth=${2:-0}
-    local line trimmed pattern nested_file nested_pattern_matched
-
-    [ "$depth" -ge 8 ] && return 0
-    [ -f "$include_file" ] || return 1
-
-    if grep -qiE '^[[:space:]]*(Port|ListenAddress|PasswordAuthentication|KbdInteractiveAuthentication|ChallengeResponseAuthentication|PubkeyAuthentication|PubkeyAcceptedAlgorithms|PermitRootLogin|UsePAM|MaxAuthTries|ClientAliveInterval|ClientAliveCountMax|LoginGraceTime|X11Forwarding|AllowAgentForwarding|AllowTcpForwarding|DisableForwarding|GatewayPorts|PermitOpen|PermitListen|PermitTTY|PermitEmptyPasswords|AuthorizedKeysFile|AuthorizedKeysCommand|AuthorizedKeysCommandUser|AuthenticationMethods|AllowUsers|DenyUsers|AllowGroups|DenyGroups|ForceCommand|ChrootDirectory|PrintMotd|Subsystem|Match)([[:space:]]|=)' "$include_file"; then
-        return 0
-    fi
-
-    while IFS= read -r line; do
-        trimmed="${line#"${line%%[![:space:]]*}"}"
-        [[ "${trimmed,,}" =~ ^include[[:space:]]+ ]] || continue
-        trimmed="${trimmed%%#*}"
-        for pattern in ${trimmed#* }; do
-            nested_pattern_matched=false
-            [[ "$pattern" = /* ]] || pattern="/etc/ssh/$pattern"
-            while IFS= read -r nested_file; do
-                nested_pattern_matched=true
-                if ssh_include_has_conflict "$nested_file" $((depth + 1)); then
-                    return 0
-                fi
-            done < <(compgen -G "$pattern" 2>/dev/null || true)
-            [ "$nested_pattern_matched" = true ] || return 0
-        done
-    done < "$include_file"
-
-    return 1
-}
-
-restore_ssh_access() {
-    warn "Восстановление исходной SSH-конфигурации и аварийного доступа на порту 22..."
-    cp "$SSHD_BACKUP_FILE" "$SSHD_CONFIG"
-
-    if [ -n "$ROOT_PASSWORD_HASH_BEFORE" ]; then
-        printf 'root:%s\n' "$ROOT_PASSWORD_HASH_BEFORE" | chpasswd -e >/dev/null 2>&1 || true
-    elif [ "$ROOT_PASSWORD_WAS_LOCKED" != true ]; then
-        passwd -u root >/dev/null 2>&1 || true
-    fi
-
-    if command -v ufw >/dev/null 2>&1; then
-        ufw allow 22/tcp comment 'SSH Recovery Port' >/dev/null 2>&1 || true
-    fi
-
-    systemctl stop ssh.service 2>/dev/null || true
-    if [ "$SSH_SOCKET_WAS_ACTIVE" = "active" ]; then
-        if [ "$SSH_SOCKET_WAS_ENABLED" = "enabled" ]; then
-            systemctl enable ssh.socket >/dev/null 2>&1 || true
-        fi
-        systemctl start ssh.socket 2>/dev/null || true
-        systemctl start ssh.service 2>/dev/null || true
-    else
-        systemctl stop ssh.socket 2>/dev/null || true
-        systemctl disable ssh.socket 2>/dev/null || true
-        systemctl enable ssh.service >/dev/null 2>&1 || true
-        sshd -t && systemctl restart ssh
-    fi
-
-    if sshd -t; then
-        sleep 2
-        if ssh_port_listening 22; then
-            warn "Исходная конфигурация восстановлена, SSH снова слушает порт 22."
-            return 0
-        fi
-    fi
-
-    error "Не удалось автоматически подтвердить восстановление порта 22. Не закрывайте текущую сессию!"
-    return 1
-}
-
-write_managed_sshd_config() {
-    local permit_root=$1
-    local keep_port_22=$2
-    local new_config="${SSHD_CONFIG}.new"
-
-    {
-        echo "# Managed by setup_ubuntu_24.04.sh"
-        echo "# Основная поддерживаемая конфигурация SSH. Провайдерские Include ниже проверены."
-        echo ""
-        echo "Port $SSH_PORT"
-        if [ "$keep_port_22" = true ]; then
-            echo "# Временный порт до ручной проверки подключения"
-            echo "Port 22"
-        fi
-        echo "AddressFamily inet"
-        echo ""
-        echo "PasswordAuthentication no"
-        echo "KbdInteractiveAuthentication no"
-        echo "ChallengeResponseAuthentication no"
-        echo "PubkeyAuthentication yes"
-        echo "AuthorizedKeysFile .ssh/authorized_keys"
-        echo "PubkeyAcceptedAlgorithms ssh-ed25519"
-        echo "PermitRootLogin $permit_root"
-        echo "UsePAM yes"
-        echo "MaxAuthTries 3"
-        echo "ClientAliveInterval 300"
-        echo "ClientAliveCountMax 2"
-        echo "LoginGraceTime 30"
-        echo "X11Forwarding no"
-        echo "AllowAgentForwarding no"
-        echo "PermitEmptyPasswords no"
-        echo "PrintMotd no"
-        echo "Subsystem sftp internal-sftp"
-
-        if [ -s "$SSH_SAFE_INCLUDES_FILE" ]; then
-            echo ""
-            echo "# Проверенные провайдерские дополнения без конфликтующих SSH-директив"
-            cat "$SSH_SAFE_INCLUDES_FILE"
-        fi
-        if [ -s "$SSH_DISABLED_INCLUDES_FILE" ]; then
-            echo ""
-            cat "$SSH_DISABLED_INCLUDES_FILE"
-        fi
-    } > "$new_config"
-
-    chmod 600 "$new_config"
-    mv "$new_config" "$SSHD_CONFIG"
-}
-
-validate_managed_ssh_effective() {
-    local permit_root=$1
-    local keep_port_22=$2
-    local expected ok=true
-    local -a expected_settings=(
-        "passwordauthentication no"
-        "addressfamily inet"
-        "kbdinteractiveauthentication no"
-        "pubkeyauthentication yes"
-        "authorizedkeysfile .ssh/authorized_keys"
-        "pubkeyacceptedalgorithms ssh-ed25519"
-        "permitrootlogin $permit_root"
-        "usepam yes"
-        "maxauthtries 3"
-        "clientaliveinterval 300"
-        "clientalivecountmax 2"
-        "logingracetime 30"
-        "x11forwarding no"
-        "allowagentforwarding no"
-        "permitemptypasswords no"
-        "printmotd no"
-    )
-
-    if ! ssh_effective_has "port $SSH_PORT"; then
-        error "Ожидалась фактическая SSH-директива: port $SSH_PORT"
-        ok=false
-    fi
-
-    if [ "$keep_port_22" = true ]; then
-        if ! ssh_effective_has "port 22"; then
-            error "Ожидалась фактическая SSH-директива: port 22"
-            ok=false
-        fi
-    elif ssh_effective_has "port 22"; then
-        error "Фактическая SSH-конфигурация всё ещё содержит port 22"
-        ok=false
-    fi
-
-    for expected in "${expected_settings[@]}"; do
-        if ! ssh_effective_has "$expected"; then
-            error "Ожидалась фактическая SSH-директива: $expected"
-            ok=false
-        fi
-    done
-
-    if ! ssh_effective_has_regex '^subsystem[[:space:]]+sftp[[:space:]]+internal-sftp[[:space:]]*$'; then
-        error "Ожидалась фактическая SSH-директива: subsystem sftp internal-sftp"
-        ok=false
-    fi
-
-    [ "$ok" = true ]
-}
-
-if ! ssh_port_listening 22; then
-    error "SSH не слушает ожидаемый исходный порт 22. Остановка до изменения конфигурации."
+# Удаляем только собственную строку Include, если она уже была установлена.
+# Остальная конфигурация провайдера переносится в кандидат без изменений.
+{
+    printf 'Include %s\n' "$SSH_WORK/final-managed"
+    awk '$0 != "Include /etc/ssh/tuning-vps.conf" {print}' "$SSHD_CONFIG"
+} > "$SSH_WORK/final-main"
+{
+    printf 'Include %s\n' "$SSH_WORK/temporary-managed"
+    awk '$0 != "Include /etc/ssh/tuning-vps.conf" {print}' "$SSHD_CONFIG"
+} > "$SSH_WORK/temporary-main"
+cat > "$SSH_WORK/temporary-managed" << EOF
+# Временный доступ: новый порт добавлен, старый вход root сохранён.
+Port 22
+Port $SSH_PORT
+AddressFamily inet
+EOF
+cat > "$SSH_WORK/final-managed" << EOF
+# Управляется setup_ubuntu_24.04.sh. Порт 22 закрывается после проверки ключа.
+Port $SSH_PORT
+AddressFamily inet
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+HostbasedAuthentication no
+GSSAPIAuthentication no
+PubkeyAuthentication yes
+PubkeyAcceptedAlgorithms ssh-ed25519
+AuthorizedKeysFile .ssh/authorized_keys
+AuthorizedKeysCommand none
+PermitRootLogin no
+PermitEmptyPasswords no
+EOF
+if ssh_unsafe_match_auth; then
+    error "Автоматическое применение SSH-политики остановлено до изменения доступа."
     exit 1
 fi
-log "Исходный SSH-порт 22 слушается."
-ACTIVE_SSH_PORTS=$(active_sshd_ports)
-OTHER_ACTIVE_SSH_PORTS=$(printf '%s\n' "$ACTIVE_SSH_PORTS" | tr ' ' '\n' | grep -vx 22 | tr '\n' ' ' || true)
-log "Другие активные SSH-порты: $OTHER_ACTIVE_SSH_PORTS"
-
-if CURRENT_SSH_PORT=$(detect_current_ssh_port); then
-    if [ "$CURRENT_SSH_PORT" != "22" ]; then
-        error "Текущая SSH-сессия подключена не к порту 22, а к порту $CURRENT_SSH_PORT."
-        error "Остановка до изменения конфигурации."
-        exit 1
-    fi
-    log "Подтверждено: текущая SSH-сессия использует порт 22."
-elif [ -z "$OTHER_ACTIVE_SSH_PORTS" ]; then
-    warn "Не удалось точно определить порт текущей SSH-сессии: SSH_CONNECTION/SSH_CLIENT отсутствуют, сокет процесса не найден."
-    warn "Такое бывает после запуска через sudo/su. Порт 22 слушается и других SSH-портов не обнаружено, продолжаем."
-else
-    error "Не удалось подтвердить порт текущей SSH-сессии, а кроме 22 обнаружены другие SSH-порты: $OTHER_ACTIVE_SSH_PORTS"
-    error "Запустите скрипт из root SSH-сессии на порту 22 или сохраните SSH_CONNECTION/SSH_CLIENT при sudo/su."
+if ! ssh_candidate_valid "$SSH_WORK/final-main" final; then
+    error "Финальный SSH-кандидат конфликтует с настройками провайдера (Include/Match/Port)."
+    report_ssh_conflict
+    exit 1
+fi
+if [ "$SSH_ACCESS_MODE" = transition ] &&
+   ! ssh_candidate_valid "$SSH_WORK/temporary-main" temporary; then
+    error "Временный SSH-кандидат не сохраняет исходный вход root на порту 22."
+    report_ssh_conflict
     exit 1
 fi
 
-log "Активные Include в основном конфиге:"
-grep -nE '^[[:space:]]*Include[[:space:]]' "$SSHD_CONFIG" || log "Активные Include отсутствуют."
-log "Состояние ssh.service: $(systemctl is-active ssh.service 2>/dev/null || true)"
-log "Состояние ssh.socket: $SSH_SOCKET_WAS_ACTIVE, $SSH_SOCKET_WAS_ENABLED"
-log "Фактические SSH-параметры до изменения:"
-sshd -T 2>/dev/null | grep -E '^(port|passwordauthentication|kbdinteractiveauthentication|pubkeyauthentication|authorizedkeysfile|permitrootlogin) ' || true
-
-if [ "$SSH_KEYS_READY" != true ] || ! id "$NEW_USER" >/dev/null 2>&1 || \
-   [ ! -d "$SSH_DIR" ] || [ ! -s "$SSH_DIR/authorized_keys" ] || \
-   [ "$(stat -c '%U:%G' "$SSH_DIR" 2>/dev/null)" != "$NEW_USER:$NEW_USER" ] || \
-   [ "$(stat -c '%a' "$SSH_DIR" 2>/dev/null)" != "700" ] || \
-   [ "$(stat -c '%U:%G' "$SSH_DIR/authorized_keys" 2>/dev/null)" != "$NEW_USER:$NEW_USER" ] || \
-   [ "$(stat -c '%a' "$SSH_DIR/authorized_keys" 2>/dev/null)" != "600" ] || \
-   ! authorized_keys_ed25519_only "$SSH_DIR/authorized_keys"; then
-    error "Пользователь, права или authorized_keys не прошли предварительную проверку."
-    exit 1
+# Точные байты main нужны для идемпотентной проверки. При отсутствии изменений
+# повторный запуск не перезапускает SSH и не запрашивает лишнее подтверждение.
+{
+    printf 'Include %s\n' "$SSH_MANAGED_CONFIG"
+    awk '$0 != "Include /etc/ssh/tuning-vps.conf" {print}' "$SSHD_CONFIG"
+} > "$SSH_WORK/runtime-main"
+SSH_CONFIG_CHANGED=false
+if ! cmp -s "$SSH_WORK/runtime-main" "$SSHD_CONFIG" ||
+   ! cmp -s "$SSH_WORK/final-managed" "$SSH_MANAGED_CONFIG"; then
+    SSH_CONFIG_CHANGED=true
 fi
-log "Пользователь $NEW_USER, права и authorized_keys прошли проверку."
-
-cp "$SSHD_CONFIG" "$SSHD_BACKUP_FILE"
-: > "$SSH_SAFE_INCLUDES_FILE"
-: > "$SSH_DISABLED_INCLUDES_FILE"
-MAIN_MATCH_CONTEXT=false
-
-while IFS= read -r include_line; do
-    trimmed="${include_line#"${include_line%%[![:space:]]*}"}"
-    if [[ "${trimmed,,}" =~ ^match[[:space:]]+ ]]; then
-        MAIN_MATCH_CONTEXT=true
-        continue
-    fi
-    [[ "${trimmed,,}" =~ ^include[[:space:]]+ ]] || continue
-    trimmed="${trimmed%%#*}"
-    INCLUDE_CONFLICT=$MAIN_MATCH_CONTEXT
-    INCLUDE_MATCHED=false
-
-    for include_pattern in ${trimmed#* }; do
-        INCLUDE_PATTERN_MATCHED=false
-        [[ "$include_pattern" = /* ]] || include_pattern="/etc/ssh/$include_pattern"
-        while IFS= read -r include_file; do
-            INCLUDE_MATCHED=true
-            INCLUDE_PATTERN_MATCHED=true
-            log "Проверка provider Include: $include_file"
-            if ssh_include_has_conflict "$include_file"; then
-                INCLUDE_CONFLICT=true
-            fi
-        done < <(compgen -G "$include_pattern" 2>/dev/null || true)
-        if [ "$INCLUDE_PATTERN_MATCHED" != true ]; then
-            INCLUDE_CONFLICT=true
-            warn "Include отключён: невозможно проверить шаблон $include_pattern"
-        fi
-    done
-
-    if [ "$INCLUDE_MATCHED" != true ]; then
-        INCLUDE_CONFLICT=true
-    fi
-
-    if [ "$INCLUDE_CONFLICT" = true ]; then
-        {
-            echo "# disabled providers include"
-            echo "# $trimmed"
-        } >> "$SSH_DISABLED_INCLUDES_FILE"
-        warn "Include отключён из-за конфликтующих директив: $trimmed"
-    else
-        echo "$trimmed" >> "$SSH_SAFE_INCLUDES_FILE"
-    fi
-done < "$SSHD_BACKUP_FILE"
-
-write_managed_sshd_config yes true
-mkdir -p /run/sshd
-
-if ! sshd -t; then
-    error "Новая основная SSH-конфигурация не прошла sshd -t."
-    restore_ssh_access
-    exit 1
+if [ "$SSH_SOCKET_WAS_ACTIVE" = active ] || [ "$SSH_SOCKET_WAS_ENABLED" = enabled ]; then
+    # Даже при тех же директивах socket может вернуть старый listener при reboot.
+    SSH_CONFIG_CHANGED=true
+fi
+if [ "$SSH_ACCESS_MODE" = transition ]; then
+    warn "Оставьте текущую административную сессию открытой до окончания контрольного входа."
 fi
 
-log "Переключение SSH с socket activation на ssh.service..."
-systemctl stop ssh.socket 2>/dev/null || true
-systemctl disable ssh.socket 2>/dev/null || true
-systemctl enable ssh.service >/dev/null 2>&1 || true
-
-if ! systemctl restart ssh; then
-    error "Не удалось перезапустить ssh.service."
-    restore_ssh_access
+# Firewall готовим перед перезапуском SSH. Сначала разрешаем старый и новый
+# порт, затем включаем deny incoming; UFW не выключается во время перехода.
+if ! command -v ufw >/dev/null 2>&1; then
+    apt-get install -y -qq ufw || { error "Не удалось установить UFW"; exit 1; }
+fi
+SSH_UFW_WAS_ACTIVE=$(LC_ALL=C ufw status 2>/dev/null | awk '/^Status:/ {print $2; exit}')
+if [ "$SSH_UFW_WAS_ACTIVE" != active ] && [ "$SSH_UFW_WAS_ACTIVE" != inactive ]; then
+    error "Не удалось определить исходное состояние UFW."
     exit 1
 fi
-
-sleep 2
-if ! validate_managed_ssh_effective yes true || \
-   ! ssh_port_listening "$SSH_PORT" || ! ssh_port_listening 22; then
-    error "Фактическая временная SSH-конфигурация отличается от ожидаемой."
-    sshd -T 2>/dev/null | grep -E '^(port|passwordauthentication|pubkeyauthentication|authorizedkeysfile|permitrootlogin) ' || true
-    restore_ssh_access
-    exit 1
+SSH_ORIGINAL_UFW=true
+if [ -e /etc/default/ufw ]; then
+    cp -p /etc/default/ufw "$SSH_WORK/original-ufw-default" || exit 1
+    SSH_ORIGINAL_UFW_DEFAULT=true
 fi
-
-log "SSH одновременно слушает временный порт 22 и новый порт $SSH_PORT."
-add_check 0 "Временная SSH-конфигурация на портах 22 и $SSH_PORT"
-
-# 10. FIREWALL (С ЗАЩИТОЙ ОТ БЛОКИРОВКИ) =======================================
-
-log "Настройка UFW (файрвол)..."
-
-apt-get install -y -qq ufw
-
-# Отключаем UFW перед настройкой (если был включен), чтобы избежать блокировки
-ufw disable 2>/dev/null || true
-
-# В этой конфигурации используется только IPv4. UFW не должен создавать v6-правила.
+if [ -e /etc/ufw/user.rules ]; then
+    cp -p /etc/ufw/user.rules "$SSH_WORK/original-ufw-rules" || exit 1
+    SSH_ORIGINAL_UFW_RULES=true
+fi
+if [ -e /etc/ufw/user6.rules ]; then
+    cp -p /etc/ufw/user6.rules "$SSH_WORK/original-ufw6-rules" || exit 1
+    SSH_ORIGINAL_UFW6_RULES=true
+fi
+SSH_ROLLBACK_NEEDED=true
 if [ -f /etc/default/ufw ]; then
     if grep -q '^IPV6=' /etc/default/ufw; then
-        sed -i 's/^IPV6=.*/IPV6=no/' /etc/default/ufw
+        sed -i 's/^IPV6=.*/IPV6=no/' /etc/default/ufw || exit 1
     else
-        echo 'IPV6=no' >> /etc/default/ufw
+        printf '\nIPV6=no\n' >> /etc/default/ufw
     fi
 fi
-
-# Политики по умолчанию
-ufw default deny incoming
-ufw default allow outgoing
-
-# Разрешаем новый SSH порт ПЕРЕД включением файрвола!
-if ! ufw_rule_exists "$SSH_PORT/tcp"; then
-    ufw allow "$SSH_PORT/tcp" comment 'SSH Custom Port'
+ufw allow "$SSH_PORT/tcp" comment 'SSH Custom Port' || exit 1
+if [ "$SSH_ACCESS_MODE" = transition ]; then
+    ufw allow 22/tcp comment 'SSH Temporary Legacy Port' || exit 1
+fi
+ufw default deny incoming || exit 1
+ufw --force enable || exit 1
+ufw reload >/dev/null || exit 1
+LC_ALL=C ufw status | grep -q '^Status: active' || exit 1
+ufw_rule_exists "$SSH_PORT/tcp" ||
+    { error "UFW не открыл новый SSH-порт"; exit 1; }
+if [ "$SSH_ACCESS_MODE" = transition ]; then
+    ufw_rule_exists '22/tcp' ||
+        { error "UFW не сохранил исходный SSH-порт"; exit 1; }
 fi
 
-# Сохраняем доступ через старый порт до ручной проверки нового подключения.
-if ! ufw_rule_exists "22/tcp"; then
-    ufw allow 22/tcp comment 'SSH Temporary Legacy Port'
+# Временный перезапуск добавляет новый порт, сохраняя исходный способ входа.
+# При ssh.socket переключаемся на ssh.service: socket может удерживать порт 22
+# независимо от sshd_config. Любая ошибка вызывает trap и полный откат.
+if [ "$SSH_ACCESS_MODE" = transition ] || [ "$SSH_CHANGED" = true ]; then
+    SSH_KEYS_TOUCHED=true
+    install -d -m 700 -o "$NEW_USER" -g "$SSH_PRIMARY_GROUP" "$SSH_DIR" || exit 1
+    install -m 600 -o "$NEW_USER" -g "$SSH_PRIMARY_GROUP" "$SSH_WORK/staged-keys" "$SSH_KEYS" || exit 1
+fi
+if [ "$SSH_ACCESS_MODE" = transition ]; then
+    SSH_CONFIG_TOUCHED=true
+    install -m 600 "$SSH_WORK/temporary-managed" "$SSH_MANAGED_CONFIG" || exit 1
+    {
+        printf 'Include %s\n' "$SSH_MANAGED_CONFIG"
+        awk '$0 != "Include /etc/ssh/tuning-vps.conf" {print}' "$SSH_WORK/original-main"
+    } > "$SSHD_CONFIG"
+    sshd -t || exit 1
+    SSH_SYSTEMD_TOUCHED=true
+    systemctl disable --now ssh.socket >/dev/null 2>&1 || exit 1
+    systemctl enable ssh.service >/dev/null 2>&1 || exit 1
+    systemctl restart ssh.service || exit 1
+    sleep 2
+    ssh_service_port_listening 22 && ssh_service_port_listening "$SSH_PORT" ||
+        { error "После временного перехода оба SSH-порта не слушаются"; exit 1; }
+    ssh_candidate_valid "$SSHD_CONFIG" temporary ||
+        { error "Временная конфигурация SSH не прошла повторную проверку"; exit 1; }
 fi
 
-# Разрешаем веб-порты
-if ! ufw_rule_exists "80/tcp"; then
-    ufw allow 80/tcp comment 'HTTP'
-fi
-if ! ufw_rule_exists "443/tcp"; then
-    ufw allow 443/tcp comment 'HTTPS'
-fi
-
-# ВАЖНО: Если UFW был включен ранее, сохраняем его состояние для восстановления доступа
-# Порт 22 будет удалён позже после проверки подключения
-
-# Включаем файрвол
-echo "y" | ufw enable
-
-# Проверка статуса
-if ufw status | grep -q "Status: active"; then
-    log "UFW активен"
-    add_check 0 "UFW включен"
-else
-    error "UFW не удалось включить"
-    add_check 1 "UFW включен"
-fi
-
-# Проверка правила SSH
-if ufw status | grep -q "$SSH_PORT"; then
-    add_check 0 "Правило UFW для порта $SSH_PORT"
-else
-    add_check 1 "Правило UFW для порта $SSH_PORT"
-fi
-
-# 11. КОНТРОЛЬНЫЙ ВХОД И ФИНАЛЬНОЕ ЗАКРЫТИЕ ПОРТА 22 ===========================
-
-SSH_VALIDATION_PASSED=true
-
-if ! validate_managed_ssh_effective yes true || \
-   ! ssh_port_listening "$SSH_PORT" || ! ssh_port_listening 22 || \
-   ! ufw_rule_exists "$SSH_PORT/tcp" || ! ufw_rule_exists "22/tcp" || \
-   ! authorized_keys_ed25519_only "$SSH_DIR/authorized_keys"; then
-    SSH_VALIDATION_PASSED=false
-fi
-
-if [ "$SSH_VALIDATION_PASSED" != true ]; then
-    error "Автоматические проверки перед контрольным входом не пройдены."
-    warn "Порт 22 и временный вход root сохранены."
-    error "SSH-hardening не завершён. Дальнейшая настройка остановлена."
-    add_check 1 "Контрольный вход SSH (автоматические проверки)"
-    exit 1
-else
-    warn "Перед продолжением обязательно проверьте вход в НОВОМ окне:"
-    warn "ssh -4 -p $SSH_PORT $NEW_USER@$SERVER_IP"
-    warn "Не закрывайте текущую root-сессию."
-    confirm=""
-
+# Ручная проверка проводится до закрытия 22/root. На повторном запуске уже
+# защищённого сервера она нужна только при изменении ключей или конфига.
+if [ "$SSH_ACCESS_MODE" = transition ] ||
+   [ "$SSH_CHANGED" = true ] ||
+   [ "$SSH_CONFIG_CHANGED" = true ]; then
+    warn "В НОВОМ окне выполните: ssh -4 -p $SSH_PORT $NEW_USER@$SERVER_IP"
+    warn "Проверьте также sudo -n true; текущую сессию не закрывайте."
+    answer=''
     if [ -r /dev/tty ]; then
-        IFS= read -r -p "Контрольный вход работает? Закрыть порт 22 и заблокировать root? (y/N): " confirm </dev/tty || confirm=""
-    else
-        warn "Нет интерактивного терминала для контрольного подтверждения."
-        warn "SSH-hardening остановлен: порт 22 и временный вход root сохранены."
-        error "Дальнейшая настройка остановлена до ручного подтверждения входа по ключу."
+        IFS= read -r -p 'Вход по новому ключу и sudo работают? (y/N): ' answer </dev/tty || answer=''
     fi
-
-    case "$confirm" in
-        y|Y|yes)
-            log "Применение финальной SSH-конфигурации..."
-            write_managed_sshd_config no false
-
-            FINAL_SSH_OK=true
-            if ! sshd -t; then
-                error "Финальная SSH-конфигурация не прошла sshd -t."
-                FINAL_SSH_OK=false
-            elif ! systemctl restart ssh; then
-                error "Не удалось перезапустить SSH с финальной конфигурацией."
-                FINAL_SSH_OK=false
-            else
-                sleep 2
-                if ! validate_managed_ssh_effective no false || \
-                   ! ssh_port_listening "$SSH_PORT" || ssh_port_listening 22; then
-                    error "Фактическая финальная SSH-конфигурация отличается от ожидаемой."
-                    FINAL_SSH_OK=false
-                fi
-            fi
-
-            if [ "$FINAL_SSH_OK" = true ]; then
-                if ! passwd -l root >/dev/null 2>&1 || \
-                   ! passwd -S root 2>/dev/null | awk '{print $2}' | grep -q '^L'; then
-                    error "Не удалось подтвердить блокировку пароля root."
-                    FINAL_SSH_OK=false
-                fi
-            fi
-
-            if [ "$FINAL_SSH_OK" = true ] && ufw_rule_exists "22/tcp"; then
-                if ! ufw --force delete allow 22/tcp >/dev/null 2>&1; then
-                    error "Не удалось удалить правило UFW для порта 22."
-                    FINAL_SSH_OK=false
-                fi
-            fi
-            if [ "$FINAL_SSH_OK" = true ] && ufw_rule_exists "22/tcp"; then
-                error "Правило UFW для порта 22 осталось после удаления."
-                FINAL_SSH_OK=false
-            fi
-
-            if [ "$FINAL_SSH_OK" = true ]; then
-                log "Контрольный вход подтверждён: порт 22 закрыт, root заблокирован."
-                add_check 0 "Финальная SSH-конфигурация"
-            else
-                error "Ошибка финального этапа. Выполняется полный откат."
-                restore_ssh_access
-                add_check 1 "Финальная SSH-конфигурация (выполнен откат)"
-                exit 1
-            fi
-            ;;
-        *)
-            warn "Подтверждение не получено. Порт 22 и временный вход root сохранены."
-            error "SSH-hardening не завершён. Дальнейшая настройка остановлена."
-            add_check 1 "Финальная SSH-конфигурация (отложена)"
-            exit 1
-            ;;
+    case "$answer" in y|Y|yes) ;; *)
+        error "Контрольный вход не подтверждён. Остальные блоки остановлены."
+        exit 1 ;;
     esac
 fi
 
-rm -f "$SSH_SAFE_INCLUDES_FILE" "$SSH_DISABLED_INCLUDES_FILE"
+# Теперь оставляем только новый порт и ровно опубликованный набор ключей.
+# Если набор ключей изменился, подтверждаем повторный вход уже после удаления
+# старых ключей, пока текущая сессия ещё доступна для отката.
+if ! cmp -s "$SSH_WORK/final-managed" "$SSH_MANAGED_CONFIG"; then
+    SSH_CONFIG_TOUCHED=true
+    install -m 600 "$SSH_WORK/final-managed" "$SSH_MANAGED_CONFIG" || exit 1
+fi
+if ! cmp -s "$SSH_WORK/runtime-main" "$SSHD_CONFIG"; then
+    SSH_CONFIG_TOUCHED=true
+    cp "$SSH_WORK/runtime-main" "$SSHD_CONFIG" || exit 1
+fi
+if [ "$SSH_ACCESS_MODE" = transition ] || [ "$SSH_CHANGED" = true ]; then
+    SSH_KEYS_TOUCHED=true
+    install -m 600 -o "$NEW_USER" -g "$SSH_PRIMARY_GROUP" "$SSH_WORK/desired-keys" "$SSH_KEYS" || exit 1
+fi
+sshd -t || exit 1
+if [ "$SSH_ACCESS_MODE" = transition ] || [ "$SSH_CONFIG_CHANGED" = true ]; then
+    SSH_SYSTEMD_TOUCHED=true
+    systemctl disable --now ssh.socket >/dev/null 2>&1 || exit 1
+    systemctl enable ssh.service >/dev/null 2>&1 || exit 1
+    systemctl restart ssh.service || exit 1
+fi
+sleep 2
+ssh_service_port_listening "$SSH_PORT" && ! ssh_port_listening 22 ||
+    { error "Финальное состояние SSH listener не подтверждено"; exit 1; }
+ssh_candidate_valid "$SSHD_CONFIG" final ||
+    { error "Финальная конфигурация SSH не прошла проверку"; exit 1; }
+if [ "$SSH_ACCESS_MODE" = transition ] ||
+   [ "$SSH_CHANGED" = true ] ||
+   [ "$SSH_CONFIG_CHANGED" = true ]; then
+    warn "Откройте ЕЩЁ ОДНУ сессию после финальной политики и точного набора ключей."
+    answer=''
+    if [ -r /dev/tty ]; then
+        IFS= read -r -p 'Повторный вход и sudo работают? (y/N): ' answer </dev/tty || answer=''
+    fi
+    case "$answer" in y|Y|yes) ;; *)
+        error "Повторный вход не подтверждён. Выполняется откат."
+        exit 1 ;;
+    esac
+fi
+
+# Блокировка пароля root выполняется последней. Удаляем разрешение 22 в UFW
+# только после подтверждённого входа и проверенного финального listener.
+if ! passwd -S root 2>/dev/null | awk '{print $2}' | grep -q '^L'; then
+    SSH_ROOT_TOUCHED=true
+    passwd -l root >/dev/null 2>&1 || exit 1
+fi
+passwd -S root 2>/dev/null | awk '{print $2}' | grep -q '^L' || exit 1
+for attempt in 1 2 3 4 5; do
+    ufw_rule_exists '22/tcp' || break
+    ufw --force delete allow 22/tcp >/dev/null || exit 1
+done
+if ufw_rule_exists '22/tcp'; then
+    error "В UFW осталось разрешение порта 22."
+    exit 1
+fi
+LC_ALL=C ufw status | grep -q '^Status: active' && ufw_rule_exists "$SSH_PORT/tcp" ||
+    { error "Финальное состояние UFW не подтверждено"; exit 1; }
+SSH_COMMITTED=true
+SSH_ROLLBACK_NEEDED=false
+trap - EXIT INT TERM
+rm -rf -- "$SSH_WORK"
+add_check 0 "Финальная SSH-конфигурация, ключи и UFW"
 
 # 12. НАСТРОЙКА FAIL2BAN (ЗАЩИTA SSH ОТ БРУТФОРСА) ============================
 
@@ -1518,7 +1512,7 @@ if command -v ssh-audit &>/dev/null; then
     
     # Проверяем локальный SSH сервер
     # ssh-audit возвращает ненулевой код при обнаружении проблем безопасности
-    SSH_AUDIT_RESULT=$(ssh-audit localhost -p $SSH_PORT 2>&1) || true
+    SSH_AUDIT_RESULT=$(ssh-audit 127.0.0.1 -p "$SSH_PORT" 2>&1) || true
     
     # Анализируем результат на наличие критических проблем
     if echo "$SSH_AUDIT_RESULT" | grep -qiE "(fail|critical|vulnerable)"; then
@@ -1570,10 +1564,10 @@ else
     SSH_STATUS_FMT="${RED}$SSH_STATUS${NC}"
 fi
 echo -e "  SSH статус:      $SSH_STATUS_FMT"
-UFW_STATUS=$(ufw status 2>/dev/null | grep -i "Status:" || echo "Status: unknown")
-if echo "$UFW_STATUS" | grep -q "active"; then
+UFW_STATUS=$(LC_ALL=C ufw status 2>/dev/null | grep '^Status:' || echo "Status: unknown")
+if [ "$UFW_STATUS" = "Status: active" ]; then
     UFW_STATUS_FMT="${GREEN}active${NC}"
-elif echo "$UFW_STATUS" | grep -q "inactive"; then
+elif [ "$UFW_STATUS" = "Status: inactive" ]; then
     UFW_STATUS_FMT="${YELLOW}inactive${NC}"
 else
     UFW_STATUS_FMT="${RED}unknown${NC}"
@@ -1599,8 +1593,13 @@ done
 echo ""
 echo "Проверка SSH конфигурации:"
 echo "--------------------------"
-echo -n "  Основной конфиг: "
-grep "^# Managed by setup_ubuntu_24.04.sh$" "$SSHD_CONFIG" &>/dev/null && echo -e "${GREEN}managed${NC}" || echo -e "${RED}FAIL${NC}"
+echo -n "  Управляемый SSH: "
+if [ -f "$SSH_MANAGED_CONFIG" ] &&
+   grep -Fxq "Include $SSH_MANAGED_CONFIG" "$SSHD_CONFIG"; then
+    echo -e "${GREEN}enabled${NC}"
+else
+    echo -e "${RED}FAIL${NC}"
+fi
 
 echo -n "  Порт применён:  "
 ssh_effective_has "port $SSH_PORT" && echo -e "${GREEN}OK${NC}" || echo -e "${RED}FAIL${NC}"
