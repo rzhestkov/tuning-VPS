@@ -51,7 +51,7 @@ error() {
 ufw_rule_exists() {
     local port=$1
     LC_ALL=C ufw status 2>/dev/null |
-        awk -v port="$port" '$1 == port && $2 == "ALLOW" && $3 == "IN" && $0 !~ /\(v6\)/ { found=1 } END { exit !found }'
+        awk -v port="$port" '$1 == port && $2 == "ALLOW" && $0 !~ /\(v6\)/ { found=1 } END { exit !found }'
 }
 
 # Базовый сценарий владеет только своим SSH-правилом. Другие allow rules могут
@@ -59,7 +59,7 @@ ufw_rule_exists() {
 ufw_unexpected_ipv4_allow_rules() {
     LC_ALL=C ufw status 2>/dev/null |
         awk -v ssh_port="$SSH_PORT/tcp" '
-            $2 == "ALLOW" && $3 == "IN" && $0 !~ /\(v6\)/ && $1 != ssh_port { print }
+            $2 == "ALLOW" && $0 !~ /\(v6\)/ && $1 != ssh_port { print }
         '
 }
 
@@ -286,6 +286,55 @@ ssh_service_port_listening() {
         END { exit !found }
     '
 }
+# Ubuntu may start SSH through ssh.socket. Stopping the socket alone can leave
+# its spawned listener alive while an administrator is connected. Kill only
+# sshd processes that own a listening socket; established shell processes do
+# not appear in this list and therefore keep the current recovery session.
+stop_sshd_listeners_on_port() {
+    local port=$1 pids pid command
+    pids=$(ss -4 -H -ltnp 2>/dev/null | awk -v port="$port" '
+        { endpoint=$4; sub(/^.*:/, "", endpoint) }
+        endpoint == port && /"sshd",pid=[0-9]+/ {
+            match($0, /pid=[0-9]+/)
+            print substr($0, RSTART + 4, RLENGTH - 4)
+        }
+    ' | sort -u)
+    for pid in $pids; do
+        command=$(ps -o comm= -p "$pid" 2>/dev/null | tr -d '[:space:]')
+        [ "$command" = sshd ] || return 1
+        kill -TERM "$pid" || return 1
+    done
+    [ -z "$pids" ] || sleep 1
+    ! ssh_port_listening "$port"
+}
+ssh_unit_is_stopped() {
+    local state
+    state=$(systemctl is-active "$1" 2>/dev/null || true)
+    [ "$state" = inactive ] || [ "$state" = failed ]
+}
+
+# Switch from either service or socket activation to ssh.service. A failed
+# socket unit is reset explicitly, because systemd otherwise treats it as a
+# failed dependency for ssh.service on the next attempt.
+stop_socket_activated_ssh_listener() {
+    systemctl disable ssh.socket >/dev/null 2>&1 || return 1
+    systemctl stop ssh.socket >/dev/null 2>&1 ||
+        ssh_unit_is_stopped ssh.socket || return 1
+    systemctl stop ssh.service >/dev/null 2>&1 ||
+        ssh_unit_is_stopped ssh.service || return 1
+    stop_sshd_listeners_on_port "$SSH_ORIGINAL_PORT" || {
+        error "Не удалось остановить SSH listener на порту $SSH_ORIGINAL_PORT."
+        return 1
+    }
+    systemctl reset-failed ssh.socket >/dev/null 2>&1 || return 1
+}
+restore_socket_activated_ssh() {
+    systemctl stop ssh.service >/dev/null 2>&1 ||
+        ssh_unit_is_stopped ssh.service || return 1
+    stop_sshd_listeners_on_port "$SSH_PORT" || return 1
+    systemctl reset-failed ssh.socket >/dev/null 2>&1 || return 1
+    systemctl start ssh.socket >/dev/null 2>&1
+}
 ssh_context_value() {
     local user=$1 port=$2 option=$3
     sshd -T -C "user=$user,host=${SSH_CLIENT_ADDR:-127.0.0.1},addr=${SSH_CLIENT_ADDR:-127.0.0.1},lport=$port" 2>/dev/null |
@@ -483,20 +532,25 @@ log "Текущее время: $CURRENT_TIME ($CURRENT_TIMEZONE)"
 
 log "Настройка hardening системных параметров ядра..."
 
-# Бэкап оригинального конфига
-if [ -f "/etc/sysctl.conf" ]; then
-    cp /etc/sysctl.conf /etc/sysctl.conf.bak.$(date +%s)
+# Базовый скрипт владеет только этим файлом. Он не переписывает sysctl.conf
+# хостера и применяет только свои параметры, не загружая чужие sysctl.d-файлы.
+SYSCTL_CONFIG=/etc/sysctl.d/99-hardening.conf
+SYSCTL_NEW=$(mktemp /etc/sysctl.d/.tuning-vps-hardening.XXXXXXXX) || exit 1
+SYSCTL_BACKUP=""
+SYSCTL_HAD_CONFIG=false
+if [ -e "$SYSCTL_CONFIG" ]; then
+    SYSCTL_BACKUP=$(mktemp /etc/sysctl.d/.tuning-vps-hardening-backup.XXXXXXXX) || exit 1
+    cp -p "$SYSCTL_CONFIG" "$SYSCTL_BACKUP" || exit 1
+    SYSCTL_HAD_CONFIG=true
 fi
 
-# Создание конфига с параметрами безопасности в /etc/sysctl.d/
-cat > /etc/sysctl.d/99-hardening.conf << 'EOF'
+cat > "$SYSCTL_NEW" << 'EOF'
+# Managed by setup_ubuntu_24.04.sh.
+# Этот файл не задаёт ip_forward и rp_filter. Forwarding, rp_filter, маршруты
+# и NAT принадлежат модулю VPN либо Docker и не должны сбрасываться при rerun.
+
 # Защита от SYN-flood
 net.ipv4.tcp_syncookies = 1
-net.ipv4.tcp_max_syn_backlog = 2048
-net.ipv4.tcp_synack_retries = 2
-
-# Отключение IP forwarding (если не нужен)
-net.ipv4.ip_forward = 0
 
 # IPv6 не используется в этой конфигурации: уменьшаем поверхность атаки.
 net.ipv6.conf.all.disable_ipv6 = 1
@@ -504,12 +558,7 @@ net.ipv6.conf.default.disable_ipv6 = 1
 net.ipv6.conf.lo.disable_ipv6 = 1
 
 # Ограничение ICMP
-net.ipv4.icmp_echo_ignore_all = 0
 net.ipv4.icmp_echo_ignore_broadcasts = 1
-
-# Защита от IP spoofing
-net.ipv4.conf.default.rp_filter = 1
-net.ipv4.conf.all.rp_filter = 1
 
 # Ограничение доступа к kernel logs
 kernel.dmesg_restrict = 1
@@ -518,13 +567,11 @@ kernel.dmesg_restrict = 1
 fs.protected_hardlinks = 1
 fs.protected_symlinks = 1
 
-# Ограничение использования памяти для root
-vm.overcommit_memory = 0
-
-# Защита от оверфлоуров
+# ASLR
 kernel.randomize_va_space = 2
 
-# Дополнительные параметры безопасности
+# Маршрутизатор не должен принимать source routes и ICMP redirects, а также
+# отправлять redirects между VPN-клиентами и внешней сетью.
 net.ipv4.tcp_rfc1337 = 1
 net.ipv4.conf.default.accept_source_route = 0
 net.ipv4.conf.all.accept_source_route = 0
@@ -532,6 +579,8 @@ net.ipv4.conf.default.accept_redirects = 0
 net.ipv4.conf.all.accept_redirects = 0
 net.ipv4.conf.default.secure_redirects = 0
 net.ipv4.conf.all.secure_redirects = 0
+net.ipv4.conf.default.send_redirects = 0
+net.ipv4.conf.all.send_redirects = 0
 net.ipv4.icmp_ignore_bogus_error_responses = 1
 
 # Автоматическая перезагрузка при kernel panic
@@ -539,15 +588,67 @@ kernel.panic = 10
 kernel.panic_on_oops = 1
 EOF
 
-# Применение настроек
-sysctl --system >/dev/null 2>&1 && log "Параметры ядра применены" || warn "Не удалось применить все параметры ядра"
-
-# Проверка основных параметров
-if sysctl -n net.ipv4.tcp_syncookies | grep -q "1"; then
-    add_check 0 "Hardening ядра (sysctl)"
-else
-    add_check 1 "Hardening ядра (sysctl)"
+# Сначала заменяем только наш файл, затем применяем именно его. При отказе
+# возвращаем прежний файл; удалённые ip_forward/rp_filter не трогаем даже при
+# миграции со старой версии, чтобы не угадывать политику уже установленного VPN.
+if ! cmp -s "$SYSCTL_NEW" "$SYSCTL_CONFIG"; then
+    install -m 0644 "$SYSCTL_NEW" "$SYSCTL_CONFIG" || exit 1
 fi
+rm -f "$SYSCTL_NEW"
+
+# Проверяем все назначенные значения из нашего файла, а не только один
+# показательный параметр. Это не проверяет ip_forward/rp_filter: они намеренно
+# исключены из области ответственности базового скрипта.
+sysctl_config_is_applied() {
+    local key expected actual
+    while IFS='=' read -r key expected; do
+        actual=$(sysctl -n "$key" 2>/dev/null) || return 1
+        [ "$actual" = "$expected" ] || return 1
+    done < <(awk -F= '
+        /^[[:space:]]*[^#[:space:]][^=]*=/ {
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", $1)
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2)
+            print $1 "=" $2
+        }
+    ' "$SYSCTL_CONFIG")
+}
+
+if SYSCTL_APPLY_OUTPUT=$(sysctl -p "$SYSCTL_CONFIG" 2>&1); then
+    SYSCTL_APPLY_OK=true
+else
+    SYSCTL_APPLY_OK=false
+fi
+if [ "$SYSCTL_APPLY_OK" != true ] ||
+   ! sysctl_config_is_applied ||
+   grep -qE '^[[:space:]]*net\.ipv4\.(ip_forward|conf\.(all|default)\.rp_filter)[[:space:]]*=' "$SYSCTL_CONFIG"; then
+    error "Не удалось применить или проверить управляемые sysctl-параметры."
+    if [ "$SYSCTL_APPLY_OK" != true ]; then
+        printf '%s\n' "$SYSCTL_APPLY_OUTPUT"
+    fi
+    if [ "$SYSCTL_HAD_CONFIG" = true ]; then
+        # Старый файл мог быть создан предыдущей версией и содержать
+        # ip_forward=0/rp_filter=1. Их нельзя вернуть ни на диск, ни runtime.
+        SYSCTL_RESTORE=$(mktemp /etc/sysctl.d/.tuning-vps-hardening-restore.XXXXXXXX) || exit 1
+        awk '
+            !/^[[:space:]]*net\.ipv4\.ip_forward[[:space:]]*=/ &&
+            !/^[[:space:]]*net\.ipv4\.conf\.(all|default)\.rp_filter[[:space:]]*=/ { print }
+        ' "$SYSCTL_BACKUP" > "$SYSCTL_RESTORE" || error "Не удалось подготовить безопасное восстановление sysctl."
+        if install -m 0644 "$SYSCTL_RESTORE" "$SYSCTL_CONFIG"; then
+            sysctl -p "$SYSCTL_RESTORE" >/dev/null 2>&1 ||
+                error "Не удалось применить восстановленный sysctl-файл."
+        else
+            error "Не удалось восстановить sysctl-файл."
+        fi
+        rm -f "$SYSCTL_RESTORE"
+    else
+        rm -f "$SYSCTL_CONFIG"
+    fi
+    add_check 1 "Hardening ядра (sysctl)"
+else
+    log "Управляемые параметры ядра применены; forwarding и rp_filter не изменялись."
+    add_check 0 "Hardening ядра (sysctl)"
+fi
+rm -f "$SYSCTL_BACKUP"
 
 # 06. СОЗДАНИЕ ПОЛЬЗОВАТЕЛЯ ====================================================
 
@@ -674,6 +775,25 @@ ssh_candidate_value() {
 ssh_candidate_port() {
     sshd -T -f "$1" 2>/dev/null |
         awk -v port="$2" '$1 == "port" && $2 == port {found=1} END {exit !found}'
+}
+# Port is cumulative in OpenSSH, unlike most authentication directives.  A
+# stock provider config often has `Port 22` in the main file after Include;
+# leaving it there would reopen 22 even though the managed file is first.
+# Remove only that global baseline setting when preparing the new main file.
+# Ports in provider drop-ins are intentionally left untouched: they are an
+# explicit conflict which must stop the automatic transition instead of being
+# guessed away.
+render_main_with_managed_include() {
+    local source=$1 include_file=$2 destination=$3
+    {
+        printf 'Include %s\n' "$include_file"
+        awk '
+            $0 == "Include /etc/ssh/tuning-vps.conf" { next }
+            !in_match && $0 ~ /^[[:space:]]*[Pp][Oo][Rr][Tt][[:space:]=]/ { next }
+            tolower($1) == "match" { in_match=1 }
+            { print }
+        ' "$source"
+    } > "$destination"
 }
 report_ssh_conflict() {
     local file
@@ -840,9 +960,8 @@ restore_ssh_state() {
         elif [ "$SSH_SERVICE_WAS_ENABLED" = disabled ]; then
             systemctl disable ssh.service >/dev/null 2>&1 || failed=true
         fi
-        if [ "$SSH_SOCKET_WAS_ACTIVE" = active ]; then
-            systemctl stop ssh.service >/dev/null 2>&1 || true
-            systemctl start ssh.socket >/dev/null 2>&1 || failed=true
+    if [ "$SSH_SOCKET_WAS_ACTIVE" = active ]; then
+            restore_socket_activated_ssh || failed=true
         else
             systemctl stop ssh.socket >/dev/null 2>&1 || true
             systemctl restart ssh.service >/dev/null 2>&1 || failed=true
@@ -925,14 +1044,8 @@ SSH_SERVICE_WAS_ENABLED=$(systemctl is-enabled ssh.service 2>/dev/null || true)
 
 # Удаляем только собственную строку Include, если она уже была установлена.
 # Остальная конфигурация провайдера переносится в кандидат без изменений.
-{
-    printf 'Include %s\n' "$SSH_WORK/final-managed"
-    awk '$0 != "Include /etc/ssh/tuning-vps.conf" {print}' "$SSHD_CONFIG"
-} > "$SSH_WORK/final-main"
-{
-    printf 'Include %s\n' "$SSH_WORK/temporary-managed"
-    awk '$0 != "Include /etc/ssh/tuning-vps.conf" {print}' "$SSHD_CONFIG"
-} > "$SSH_WORK/temporary-main"
+render_main_with_managed_include "$SSHD_CONFIG" "$SSH_WORK/final-managed" "$SSH_WORK/final-main"
+render_main_with_managed_include "$SSHD_CONFIG" "$SSH_WORK/temporary-managed" "$SSH_WORK/temporary-main"
 cat > "$SSH_WORK/temporary-managed" << EOF
 # Временный доступ: новый порт добавлен, старый вход root сохранён.
 Port 22
@@ -970,12 +1083,11 @@ if [ "$SSH_ACCESS_MODE" = transition ] &&
     exit 1
 fi
 
-# Точные байты main нужны для идемпотентной проверки. При отсутствии изменений
-# повторный запуск не перезапускает SSH и не запрашивает лишнее подтверждение.
-{
-    printf 'Include %s\n' "$SSH_MANAGED_CONFIG"
-    awk '$0 != "Include /etc/ssh/tuning-vps.conf" {print}' "$SSHD_CONFIG"
-} > "$SSH_WORK/runtime-main"
+# Точные байты main нужны для идемпотентной проверки. Одновременно удаляется
+# только глобальный Port из базового main: final managed-файл остаётся
+# единственным владельцем listener. При отсутствии изменений SSH не
+# перезапускается и не запрашивает лишнее подтверждение.
+render_main_with_managed_include "$SSHD_CONFIG" "$SSH_MANAGED_CONFIG" "$SSH_WORK/runtime-main"
 SSH_CONFIG_CHANGED=false
 if ! cmp -s "$SSH_WORK/runtime-main" "$SSHD_CONFIG" ||
    ! cmp -s "$SSH_WORK/final-managed" "$SSH_MANAGED_CONFIG"; then
@@ -1058,13 +1170,12 @@ fi
 if [ "$SSH_ACCESS_MODE" = transition ]; then
     SSH_CONFIG_TOUCHED=true
     install -m 600 "$SSH_WORK/temporary-managed" "$SSH_MANAGED_CONFIG" || exit 1
-    {
-        printf 'Include %s\n' "$SSH_MANAGED_CONFIG"
-        awk '$0 != "Include /etc/ssh/tuning-vps.conf" {print}' "$SSH_WORK/original-main"
-    } > "$SSHD_CONFIG"
+    render_main_with_managed_include "$SSH_WORK/original-main" "$SSH_MANAGED_CONFIG" "$SSHD_CONFIG"
     sshd -t || exit 1
     SSH_SYSTEMD_TOUCHED=true
-    systemctl disable --now ssh.socket >/dev/null 2>&1 || exit 1
+    # Do this even if ssh.socket is currently failed: it may have left a
+    # listener behind after an earlier interrupted migration.
+    stop_socket_activated_ssh_listener || exit 1
     systemctl enable ssh.service >/dev/null 2>&1 || exit 1
     systemctl restart ssh.service || exit 1
     sleep 2
