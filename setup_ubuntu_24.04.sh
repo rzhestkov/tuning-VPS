@@ -1391,59 +1391,178 @@ add_check $AUDIT_RULES_VALIDATION_OK "Настройка правил аудит
 
 log "Настройка автоматических обновлений безопасности..."
 
-UNATTENDED_CONFIG="/etc/apt/apt.conf.d/50unattended-upgrades"
-UNATTENDED_BACKUP="${UNATTENDED_CONFIG}.bak.$(date +%s)"
+# Пакетный 50unattended-upgrades принадлежит Ubuntu и может меняться при
+# обновлении пакета. Политика проекта живёт в отдельном файле с более поздним
+# номером: она переживает обновления и не стирает настройки дистрибутива.
+UNATTENDED_CONFIG="/etc/apt/apt.conf.d/99-tuning-vps-auto-upgrades"
+UNATTENDED_NEW=$(mktemp /etc/apt/apt.conf.d/.tuning-vps-auto-upgrades.XXXXXXXX) || exit 1
+UNATTENDED_BACKUP=""
 UNATTENDED_CONFIG_EXISTED=false
 AUTO_UPDATE_FAILURE=""
+AUTO_UPDATE_RUN_EVIDENCE=""
+APT_DAILY_ENABLED_BEFORE=$(systemctl is-enabled apt-daily.timer 2>/dev/null || true)
+APT_DAILY_UPGRADE_ENABLED_BEFORE=$(systemctl is-enabled apt-daily-upgrade.timer 2>/dev/null || true)
+APT_DAILY_ACTIVE_BEFORE=$(systemctl is-active apt-daily.timer 2>/dev/null || true)
+APT_DAILY_UPGRADE_ACTIVE_BEFORE=$(systemctl is-active apt-daily-upgrade.timer 2>/dev/null || true)
 
 if [ -f "$UNATTENDED_CONFIG" ]; then
+    UNATTENDED_BACKUP=$(mktemp /etc/apt/apt.conf.d/.tuning-vps-auto-upgrades-backup.XXXXXXXX) || exit 1
     UNATTENDED_CONFIG_EXISTED=true
-    cp "$UNATTENDED_CONFIG" "$UNATTENDED_BACKUP"
+    cp -p "$UNATTENDED_CONFIG" "$UNATTENDED_BACKUP" || exit 1
 fi
 
-if ! apt-get install -y -qq unattended-upgrades apt-listchanges; then
+restore_apt_timer_state() {
+    local unit enabled active
+    while [ "$#" -gt 0 ]; do
+        unit=$1 enabled=$2 active=$3
+        shift 3
+        case "$enabled" in
+            enabled) systemctl enable "$unit" >/dev/null 2>&1 || return 1 ;;
+            disabled) systemctl disable "$unit" >/dev/null 2>&1 || return 1 ;;
+        esac
+        case "$active" in
+            active) systemctl start "$unit" >/dev/null 2>&1 || return 1 ;;
+            inactive|failed) systemctl stop "$unit" >/dev/null 2>&1 || return 1 ;;
+        esac
+    done
+}
+
+# Ранние версии скрипта оставляли свои timestamp-backup рядом с APT-конфигами.
+# APT игнорирует их, но печатает предупреждение при каждом запуске. Переносим
+# только строго этот исторический шаблон в обычный root-only каталог бэкапов.
+migrate_legacy_unattended_backups() {
+    local legacy backup_dir destination
+    backup_dir=/var/backups/tuning-vps
+    for legacy in /etc/apt/apt.conf.d/50unattended-upgrades.bak.[0-9]*; do
+        [ -f "$legacy" ] || continue
+        [[ "${legacy##*/}" =~ ^50unattended-upgrades\.bak\.[0-9]+$ ]] || continue
+        install -d -m 0700 "$backup_dir" || return 1
+        destination="$backup_dir/${legacy##*/}"
+        if [ -e "$destination" ]; then
+            if cmp -s "$legacy" "$destination"; then
+                rm -f "$legacy" || return 1
+                continue
+            fi
+            destination="${destination}.migrated.$(date +%s)"
+        fi
+        cp -p "$legacy" "$destination" && rm -f "$legacy" || return 1
+    done
+}
+
+if ! migrate_legacy_unattended_backups; then
+    warn "Не удалось убрать старые резервные копии 50unattended-upgrades из каталога APT."
+fi
+
+if ! apt-get install -y -qq unattended-upgrades; then
     AUTO_UPDATE_FAILURE="не удалось установить unattended-upgrades"
 else
-    dpkg-reconfigure -plow unattended-upgrades -fnoninteractive >/dev/null 2>&1 || true
+    cat > "$UNATTENDED_NEW" << 'EOF'
+#clear Unattended-Upgrade::Allowed-Origins;
+#clear Unattended-Upgrade::Origins-Pattern;
 
-    cat > "$UNATTENDED_CONFIG" << 'EOF'
+# Устанавливаются обычные и security-обновления Ubuntu. Сторонние репозитории
+# не входят в этот список и требуют отдельной осознанной политики приложения.
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";
 Unattended-Upgrade::Allowed-Origins {
+    "${distro_id}:${distro_codename}";
     "${distro_id}:${distro_codename}-security";
 };
 Unattended-Upgrade::AutoFixInterruptedDpkg "true";
 Unattended-Upgrade::MinimalSteps "true";
 Unattended-Upgrade::InstallOnShutdown "false";
-Unattended-Upgrade::Remove-Unused-Dependencies "true";
-Unattended-Upgrade::Remove-New-Unused-Dependencies "true";
-Unattended-Upgrade::SyslogEnable "true";
-# Отключаем автоматическую перезагрузку (управление перезагрузкой вручную)
-Unattended-Upgrade::Automatic-Reboot "false";
+Unattended-Upgrade::Remove-Unused-Dependencies "false";
+Unattended-Upgrade::Remove-New-Unused-Dependencies "false";
+# Сервер обслуживается без постоянного участия администратора. Когда пакет
+# требует reboot, он выполняется ночью по времени, установленному выше.
+Unattended-Upgrade::Automatic-Reboot "true";
 Unattended-Upgrade::Automatic-Reboot-Time "03:00";
+Unattended-Upgrade::Automatic-Reboot-WithUsers "true";
 EOF
 
-    systemctl enable --now apt-daily.timer apt-daily-upgrade.timer >/dev/null 2>&1 || true
+    if ! cmp -s "$UNATTENDED_NEW" "$UNATTENDED_CONFIG"; then
+        install -m 0644 "$UNATTENDED_NEW" "$UNATTENDED_CONFIG" ||
+            AUTO_UPDATE_FAILURE="не удалось установить управляемую APT-конфигурацию"
+    fi
 
-    APT_EFFECTIVE_CONFIG=$(apt-config dump 2>/dev/null)
-    if ! grep -Fq 'Unattended-Upgrade::Allowed-Origins:: "${distro_id}:${distro_codename}-security";' <<< "$APT_EFFECTIVE_CONFIG"; then
-        AUTO_UPDATE_FAILURE="security origin отсутствует в итоговой APT-конфигурации"
-    elif ! grep -Fq 'Unattended-Upgrade::Automatic-Reboot "false";' <<< "$APT_EFFECTIVE_CONFIG"; then
-        AUTO_UPDATE_FAILURE="автоматическая перезагрузка не отключена"
-    elif ! systemctl is-enabled --quiet apt-daily.timer apt-daily-upgrade.timer || \
-         ! systemctl is-active --quiet apt-daily.timer apt-daily-upgrade.timer; then
+    if [ -z "$AUTO_UPDATE_FAILURE" ] &&
+       ! systemctl enable --now apt-daily.timer apt-daily-upgrade.timer >/dev/null 2>&1; then
+        AUTO_UPDATE_FAILURE="не удалось включить таймеры apt-daily и apt-daily-upgrade"
+    fi
+
+    if [ -z "$AUTO_UPDATE_FAILURE" ]; then
+        APT_EFFECTIVE_CONFIG=$(apt-config dump 2>/dev/null) ||
+            AUTO_UPDATE_FAILURE="не удалось прочитать итоговую APT-конфигурацию"
+    fi
+    if [ -z "$AUTO_UPDATE_FAILURE" ] &&
+       { ! grep -Fqx 'APT::Periodic::Update-Package-Lists "1";' <<< "$APT_EFFECTIVE_CONFIG" ||
+         ! grep -Fqx 'APT::Periodic::Unattended-Upgrade "1";' <<< "$APT_EFFECTIVE_CONFIG"; }; then
+        AUTO_UPDATE_FAILURE="ежедневные APT::Periodic параметры отсутствуют в итоговой конфигурации"
+    elif [ -z "$AUTO_UPDATE_FAILURE" ] &&
+         { ! grep -Fqx 'Unattended-Upgrade::Allowed-Origins:: "${distro_id}:${distro_codename}";' <<< "$APT_EFFECTIVE_CONFIG" ||
+           ! grep -Fqx 'Unattended-Upgrade::Allowed-Origins:: "${distro_id}:${distro_codename}-security";' <<< "$APT_EFFECTIVE_CONFIG" ||
+           [ "$(grep -Fc 'Unattended-Upgrade::Allowed-Origins::' <<< "$APT_EFFECTIVE_CONFIG")" -ne 2 ] ||
+           grep -Fq 'Unattended-Upgrade::Origins-Pattern::' <<< "$APT_EFFECTIVE_CONFIG"; }; then
+        AUTO_UPDATE_FAILURE="итоговая политика unattended-upgrades не ограничена обычными и security-обновлениями Ubuntu"
+    elif [ -z "$AUTO_UPDATE_FAILURE" ] &&
+         { ! grep -Fqx 'Unattended-Upgrade::Automatic-Reboot "true";' <<< "$APT_EFFECTIVE_CONFIG" ||
+           ! grep -Fqx 'Unattended-Upgrade::Automatic-Reboot-Time "03:00";' <<< "$APT_EFFECTIVE_CONFIG" ||
+           ! grep -Fqx 'Unattended-Upgrade::Automatic-Reboot-WithUsers "true";' <<< "$APT_EFFECTIVE_CONFIG" ||
+           ! grep -Fqx 'Unattended-Upgrade::Remove-Unused-Dependencies "false";' <<< "$APT_EFFECTIVE_CONFIG" ||
+           ! grep -Fqx 'Unattended-Upgrade::Remove-New-Unused-Dependencies "false";' <<< "$APT_EFFECTIVE_CONFIG"; }; then
+        AUTO_UPDATE_FAILURE="итоговая политика unattended-upgrades отличается от безопасной базовой"
+    elif [ -z "$AUTO_UPDATE_FAILURE" ] &&
+         { ! systemctl is-enabled --quiet apt-daily.timer apt-daily-upgrade.timer ||
+           ! systemctl is-active --quiet apt-daily.timer apt-daily-upgrade.timer; }; then
         AUTO_UPDATE_FAILURE="таймеры apt-daily и apt-daily-upgrade не включены или не активны"
     fi
 fi
+rm -f "$UNATTENDED_NEW"
 
 if [ -z "$AUTO_UPDATE_FAILURE" ]; then
-    add_result "OK" "Unattended-upgrades" "security-обновления активны, автоматическая перезагрузка отключена"
+    # Само наличие активного таймера не доказывает, что worker уже выполнялся.
+    # Ищем только служебный факт запуска, без разбора пакетов или адресов.
+    AUTO_UPDATE_LAST_RUN=$(grep -F 'Starting unattended upgrades script' \
+        /var/log/unattended-upgrades/unattended-upgrades.log 2>/dev/null | tail -n 1 || true)
+    AUTO_UPDATE_CONFIG_MTIME=$(stat -c '%Y' "$UNATTENDED_CONFIG" 2>/dev/null || true)
+    AUTO_UPDATE_LAST_RUN_EPOCH=""
+    if [ -n "$AUTO_UPDATE_LAST_RUN" ]; then
+        AUTO_UPDATE_LAST_RUN_EPOCH=$(date -d "${AUTO_UPDATE_LAST_RUN%%,*}" +%s 2>/dev/null || true)
+    fi
+    if [[ "$AUTO_UPDATE_LAST_RUN_EPOCH" =~ ^[0-9]+$ ]] &&
+       [[ "$AUTO_UPDATE_CONFIG_MTIME" =~ ^[0-9]+$ ]] &&
+       [ "$AUTO_UPDATE_LAST_RUN_EPOCH" -ge "$AUTO_UPDATE_CONFIG_MTIME" ]; then
+        AUTO_UPDATE_RUN_EVIDENCE="worker запускался после применения текущей политики"
+    else
+        # apt.systemd.daily не запускает worker повторно в тот же период. Такой
+        # успешный service-run доказывает работу таймера, но не новую установку
+        # обновлений; это нужно отличать от полностью отсутствующего запуска.
+        AUTO_UPDATE_SERVICE_RUN=$(journalctl --since "@${AUTO_UPDATE_CONFIG_MTIME:-0}" \
+            -u apt-daily-upgrade.service --no-pager -o cat 2>/dev/null |
+            grep -F 'Finished apt-daily-upgrade.service' | tail -n 1 || true)
+        if [ -n "$AUTO_UPDATE_SERVICE_RUN" ]; then
+            AUTO_UPDATE_RUN_EVIDENCE="apt-daily-upgrade.service завершился после политики; worker ожидает следующего периода"
+        elif [ -n "$AUTO_UPDATE_LAST_RUN" ]; then
+            AUTO_UPDATE_RUN_EVIDENCE="последний worker был до текущей политики; проверьте журнал после ближайшего запуска таймера"
+        else
+            AUTO_UPDATE_RUN_EVIDENCE="нет записи о выполнении worker; проверьте журнал после ближайшего запуска таймера"
+        fi
+    fi
+    add_result "OK" "Unattended-upgrades" "ежедневные обновления Ubuntu включены; reboot при необходимости в 03:00; $AUTO_UPDATE_RUN_EVIDENCE"
 else
     if [ "$UNATTENDED_CONFIG_EXISTED" = true ]; then
-        cp "$UNATTENDED_BACKUP" "$UNATTENDED_CONFIG"
+        cp -p "$UNATTENDED_BACKUP" "$UNATTENDED_CONFIG" ||
+            error "Не удалось восстановить прежний управляемый APT-файл."
     else
         rm -f "$UNATTENDED_CONFIG"
     fi
+    restore_apt_timer_state \
+        apt-daily.timer "$APT_DAILY_ENABLED_BEFORE" "$APT_DAILY_ACTIVE_BEFORE" \
+        apt-daily-upgrade.timer "$APT_DAILY_UPGRADE_ENABLED_BEFORE" "$APT_DAILY_UPGRADE_ACTIVE_BEFORE" ||
+        error "Не удалось полностью восстановить исходное состояние APT-таймеров."
     add_result "FAIL" "Unattended-upgrades" "$AUTO_UPDATE_FAILURE"
 fi
+rm -f "$UNATTENDED_BACKUP"
 
 # 15. НАСТРОЙКА NEEDRESTART (АВТОМАТИЧЕСКИЙ ПЕРЕЗАПУСК СЕРВИСОВ) =============
 
@@ -2121,4 +2240,3 @@ fi
 echo ""
 echo "===НАСТРОЙКА ЗАВЕРШЕНА==="
 echo ""
-

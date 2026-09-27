@@ -150,7 +150,7 @@ ssh -4 -p 2332 user1@SERVER_IP
 | **08–11. SSH и UFW**          | Проверяет ключи, добавляет управляемый SSH-файл и настраивает UFW              | Добавляет только SSH, сохраняет внешние правила и выводит их в отчёте                                                    |
 | **12. Fail2ban**             | Защита SSH от брутфорса                                                       | 3 попытки, бан на 1 час, настроен на кастомный порт SSH                                                                  |
 | **13. Auditd**               | Аудит действий на сервере                                                     | Логирование изменений системных файлов, SSH конфигурации                                                                 |
-| **14. Автообновления**       | Настраивает основной `/etc/apt/apt.conf.d/50unattended-upgrades`              | Проверяет итоговую конфигурацию через `apt-config` и состояние timers                                                    |
+| **14. Автообновления**       | Создаёт `/etc/apt/apt.conf.d/99-tuning-vps-auto-upgrades`                     | Ежедневные обычные и security-обновления Ubuntu, reboot в 03:00, проверка `apt-config`, timers и worker                  |
 | **15. Needrestart**          | Настраивает основной `/etc/needrestart/needrestart.conf`                      | Проверяет синтаксис Perl и фактически загруженное значение                                                               |
 | **16. Journald**             | Настраивает основной `/etc/systemd/journald.conf`                             | Persistent storage, лимит 500МБ, проверка поддерживаемых директив и журнала ошибок                                       |
 | **17. Logrotate**            | Настраивает ротацию логов                                                     | Ежедневная ротация, 7 копий, сжатие для системных логов                                                                  |
@@ -199,6 +199,14 @@ Docker может публиковать порты через свой firewall
 
 При обновлении со старой версией скрипта устаревшие строки исчезают из управляемого файла, но текущие runtime-значения не меняются автоматически: без знания топологии сервера нельзя безопасно выбирать замену. VPN-модуль должен явно задавать собственную политику.
 
+### Автоматические обновления
+
+Скрипт не меняет пакетный `/etc/apt/apt.conf.d/50unattended-upgrades`. Его собственный файл `/etc/apt/apt.conf.d/99-tuning-vps-auto-upgrades` включает ежедневное обновление списков пакетов и автоматическую установку обычных и security-обновлений Ubuntu. PPA и другие сторонние репозитории остаются вне автоматической установки.
+
+Автоматическое удаление неиспользуемых пакетов выключено. Если после обновления требуется перезагрузка, unattended-upgrades выполнит её в 03:00 по текущей временной зоне сервера, даже при активных пользовательских сессиях. После первого запуска в отчёте видно, запускался ли `unattended-upgrades` уже после применения этой политики. Если worker отложен до следующего периода, отчёт отдельно показывает успешный запуск `apt-daily-upgrade.service`; запись о более раннем worker не считается подтверждением работы новой конфигурации.
+
+Старые файлы `50unattended-upgrades.bak.<timestamp>`, созданные прежними версиями скрипта, переносятся в `/var/backups/tuning-vps`, чтобы APT не выдавал предупреждение при чтении каталога конфигурации.
+
 ## ⚠️ Безопасность и защита от блокировки
 
 ### Почему вы не потеряете доступ:
@@ -240,8 +248,10 @@ sudo -u user1 docker ps
 docker ps --format 'table {{.Names}}\t{{.Ports}}'
 
 # Проверка автоматических обновлений
-systemctl list-timers apt-daily-upgrade.timer
-cat /var/log/unattended-upgrades/unattended-upgrades.log | tail -5
+apt-config dump | grep -E '^(APT::Periodic::(Update-Package-Lists|Unattended-Upgrade)|Unattended-Upgrade::Allowed-Origins::|Unattended-Upgrade::Automatic-Reboot)'
+systemctl is-enabled apt-daily.timer apt-daily-upgrade.timer
+systemctl is-active apt-daily.timer apt-daily-upgrade.timer
+grep -F 'Starting unattended upgrades script' /var/log/unattended-upgrades/unattended-upgrades.log | tail -1
 
 # Проверка временной зоны и времени
 timedatectl
