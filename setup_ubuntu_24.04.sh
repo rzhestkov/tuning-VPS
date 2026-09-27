@@ -30,8 +30,7 @@ declare -a CHECKS
 
 # Состояния опциональных компонентов
 DOCKER_STATE="not-installed"
-MTPROTO_STATE="not-requested"
-MTPROTO_IMPLEMENTATION=""
+DOCKER_USER_ACCESS="not-requested"
 
 # Функция логирования
 log() {
@@ -92,6 +91,100 @@ report_docker_network_exposure() {
         add_result "WARN" "Docker network" "$count контейнер(ов) публикуют порты; проверьте bind и DOCKER-USER"
     else
         add_result "OK" "Docker network" "внешние опубликованные порты контейнеров не обнаружены"
+    fi
+}
+
+# Docker по умолчанию может хранить json-file логи без ограничения. Для новых
+# контейнеров задаём local driver с ротацией. Существующий daemon не
+# перезапускаем: это могло бы остановить чужие контейнеры во время rerun.
+DOCKER_LOGGING_CHANGED=false
+DOCKER_LOGGING_CONFLICT=""
+DOCKER_LOGGING_CONFIGURED_DURING_INSTALL=false
+configure_docker_logging() {
+    local config output status
+    config=/etc/docker/daemon.json
+    DOCKER_LOGGING_CHANGED=false
+    DOCKER_LOGGING_CONFLICT=""
+    install -d -m 0755 /etc/docker || return 1
+    output=$(python3 - "$config" <<'PY'
+import json
+import os
+import sys
+import tempfile
+
+path = sys.argv[1]
+expected_driver = "local"
+expected_opts = {"max-size": "10m", "max-file": "3", "compress": "true"}
+
+if os.path.exists(path):
+    try:
+        with open(path, encoding="utf-8") as source:
+            config = json.load(source)
+    except (OSError, ValueError) as error:
+        raise SystemExit(f"cannot read valid JSON from daemon.json: {error}")
+    if not isinstance(config, dict):
+        raise SystemExit("daemon.json must contain a JSON object")
+else:
+    config = {}
+
+driver = config.get("log-driver")
+if driver not in (None, expected_driver):
+    raise SystemExit(f"existing log-driver {driver!r} is not {expected_driver!r}")
+options = config.get("log-opts", {})
+if not isinstance(options, dict):
+    raise SystemExit("existing log-opts is not a JSON object")
+for key, value in expected_opts.items():
+    if key in options and str(options[key]) != value:
+        raise SystemExit(f"existing log-opts[{key!r}] differs from {value!r}")
+
+changed = driver != expected_driver or any(options.get(key) != value for key, value in expected_opts.items())
+if changed:
+    config["log-driver"] = expected_driver
+    config["log-opts"] = {**options, **expected_opts}
+    fd, temporary = tempfile.mkstemp(prefix=".tuning-vps-daemon.", dir=os.path.dirname(path), text=True)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as destination:
+            json.dump(config, destination, indent=2, sort_keys=True)
+            destination.write("\n")
+        os.chmod(temporary, 0o644)
+        os.replace(temporary, path)
+    except BaseException:
+        os.unlink(temporary)
+        raise
+print("changed" if changed else "already-configured")
+PY
+    )
+    status=$?
+    if [ "$status" -eq 0 ]; then
+        [ "$output" = changed ] && DOCKER_LOGGING_CHANGED=true
+        return 0
+    fi
+    DOCKER_LOGGING_CONFLICT=${output:-"не удалось подготовить /etc/docker/daemon.json"}
+    return 1
+}
+
+report_docker_logging_policy() {
+    local driver
+    if ! command -v docker >/dev/null 2>&1; then
+        return 0
+    fi
+    if [ -n "$DOCKER_LOGGING_CONFLICT" ]; then
+        add_result "WARN" "Docker logs" "существующая политика не изменена: $DOCKER_LOGGING_CONFLICT"
+    elif [ "$DOCKER_LOGGING_CHANGED" = true ]; then
+        if docker info >/dev/null 2>&1; then
+            add_result "WARN" "Docker logs" "local driver с лимитом 10M × 3 подготовлен; работающий daemon не перезапускался"
+        else
+            add_result "OK" "Docker logs" "local driver с лимитом 10M × 3 будет применён при следующем запуске daemon"
+        fi
+    elif [ -f /etc/docker/daemon.json ]; then
+        driver=$(docker info --format '{{.LoggingDriver}}' 2>/dev/null || true)
+        if [ "$driver" = local ]; then
+            add_result "OK" "Docker logs" "ротация local 10M × 3 настроена и активна"
+        elif [ -n "$driver" ]; then
+            add_result "WARN" "Docker logs" "в daemon.json задан local 10M × 3, но активен $driver; нужен плановый restart Docker"
+        else
+            add_result "OK" "Docker logs" "local 10M × 3 подготовлен и будет применён при следующем запуске daemon"
+        fi
     fi
 }
 
@@ -1312,80 +1405,119 @@ else
     add_check 1 "Установка fail2ban"
 fi
 
-# 13. НАСТРОЙКА AUDITD (АУДИТ ДЕЙСТВИЙ) =======================================
+# 13. AUDITD: ТОЛЬКО ИЗМЕНЕНИЯ КОНФИГУРАЦИИ ==================================
 
-log "Настройка auditd (аудит действий)..."
+log "Настройка приватного auditd..."
 
-# Установка auditd
-apt-get install -y -qq auditd audispd-plugins
+# Auditd оставляем для признаков изменения критичных конфигураций. Он не должен
+# фиксировать соединения VPN, DNS, аргументы команд или каждую запись auth.log:
+# такие события раскрывают активность пользователей и быстро расходуют диск.
+AUDIT_RULES_CONFIG=/etc/audit/rules.d/99-tuning-vps-privacy.rules
+AUDIT_RULES_NEW=""
+AUDIT_RULES_BACKUP=""
+AUDIT_RULES_EXISTED=false
+AUDIT_FAILURE=""
 
-# Включение и запуск auditd
-systemctl enable auditd 2>/dev/null || true
-systemctl start auditd 2>/dev/null || true
+# Убираем только известный файл старой версии проекта. Чужие rules.d-файлы не
+# изменяем; если они содержат аудит трафика, это будет явно видно в отчёте.
+migrate_legacy_tuning_audit_rules() {
+    local legacy backup_dir destination
+    legacy=/etc/audit/rules.d/99-custom.rules
+    [ -f "$legacy" ] || return 0
+    if ! grep -qE '(^|[[:space:]])-k[[:space:]]+(network_connect|bash_execution|privileged_execution)([[:space:]]|$)' "$legacy"; then
+        return 0
+    fi
+    backup_dir=/var/backups/tuning-vps/audit
+    install -d -m 0700 "$backup_dir" || return 1
+    destination="$backup_dir/99-custom.rules.legacy"
+    if [ -e "$destination" ]; then
+        cmp -s "$legacy" "$destination" && { rm -f "$legacy"; return; }
+        destination="${destination}.$(date +%s)"
+    fi
+    cp -p "$legacy" "$destination" && rm -f "$legacy"
+}
 
-# Проверка статуса auditd
-if systemctl is-active auditd &>/dev/null; then
-    log "Auditd установлен и запущен"
-    add_check 0 "Установка auditd"
-else
-    warn "Не удалось запустить auditd"
-    add_check 1 "Установка auditd"
+if ! migrate_legacy_tuning_audit_rules; then
+    AUDIT_FAILURE="не удалось перенести устаревшие правила auditd проекта"
+fi
+if [ -z "$AUDIT_FAILURE" ] && ! apt-get install -y -qq auditd; then
+    AUDIT_FAILURE="не удалось установить auditd"
+fi
+if [ -z "$AUDIT_FAILURE" ] && ! install -d -m 0750 /etc/audit/rules.d; then
+    AUDIT_FAILURE="не удалось создать каталог правил auditd"
+fi
+if [ -z "$AUDIT_FAILURE" ]; then
+    AUDIT_RULES_NEW=$(mktemp /etc/audit/rules.d/.tuning-vps-privacy.XXXXXXXX) ||
+        AUDIT_FAILURE="не удалось подготовить временный файл правил auditd"
+fi
+if [ -z "$AUDIT_FAILURE" ] && [ -f "$AUDIT_RULES_CONFIG" ]; then
+    AUDIT_RULES_BACKUP=$(mktemp /etc/audit/rules.d/.tuning-vps-privacy-backup.XXXXXXXX) ||
+        AUDIT_FAILURE="не удалось подготовить резервную копию правил auditd"
+    if [ -z "$AUDIT_FAILURE" ]; then
+        if cp -p "$AUDIT_RULES_CONFIG" "$AUDIT_RULES_BACKUP"; then
+            AUDIT_RULES_EXISTED=true
+        else
+            AUDIT_FAILURE="не удалось сохранить прежние правила auditd"
+        fi
+    fi
+fi
+if [ -z "$AUDIT_FAILURE" ] && ! systemctl enable --now auditd >/dev/null 2>&1; then
+    AUDIT_FAILURE="не удалось включить auditd"
 fi
 
-# Настройка правил аудита для важных событий
-cat > /etc/audit/rules.d/99-custom.rules << 'EOF'
-# Аудит изменений в системных файлах
--w /etc/passwd -p wa -k identity
--w /etc/group -p wa -k identity
--w /etc/shadow -p wa -k identity
--w /etc/sudoers -p wa -k identity
-
-# Аудит изменений в SSH конфигурации
--w /etc/ssh/sshd_config -p wa -k sshd_config
--w /etc/ssh/sshd_config.d/ -p wa -k sshd_config
-
-# Аудит входов в систему
--w /var/log/auth.log -p wa -k auth_log
-
-# Аудит выполнения команд
--w /bin/bash -p x -k bash_execution
--w /usr/bin/bash -p x -k bash_execution
-
-# Аудит изменений в cron
--w /etc/cron.d -p wa -k cron
--w /etc/cron.daily -p wa -k cron
--w /etc/cron.hourly -p wa -k cron
--w /etc/cron.monthly -p wa -k cron
--w /etc/cron.weekly -p wa -k cron
--w /etc/crontab -p wa -k cron
-
-# Аудит загрузки системы
--w /etc/init.d -p wa -k init
--w /etc/rc.local -p wa -k init
-
-# Аудит сетевых подключений
--a always,exit -F arch=b64 -S connect -k network_connect
--a always,exit -F arch=b64 -S accept -k network_connect
-
-# Аудит важных системных вызовов
--a always,exit -F arch=b64 -S execve -F euid=0 -k privileged_execution
--a always,exit -F arch=b64 -S chmod,fchmod,fchmodat,chown,fchown,fchownat,lchown -F euid=0 -k file_perm_mod
--a always,exit -F arch=b64 -S sethostname,setdomainname -k system_locale
+if [ -z "$AUDIT_FAILURE" ]; then
+cat > "$AUDIT_RULES_NEW" << 'EOF'
+# Managed by setup_ubuntu_24.04.sh.
+# Только изменения административной конфигурации; без сетевых событий и execve.
+-w /etc/passwd -p wa -k tuning_vps_identity
+-w /etc/group -p wa -k tuning_vps_identity
+-w /etc/shadow -p wa -k tuning_vps_identity
+-w /etc/sudoers -p wa -k tuning_vps_sudo
+-w /etc/sudoers.d/ -p wa -k tuning_vps_sudo
+-w /etc/ssh/sshd_config -p wa -k tuning_vps_ssh
+-w /etc/ssh/sshd_config.d/ -p wa -k tuning_vps_ssh
+-w /etc/apt/apt.conf.d/ -p wa -k tuning_vps_apt
+-w /etc/systemd/system/ -p wa -k tuning_vps_systemd
+-w /etc/cron.d/ -p wa -k tuning_vps_cron
+-w /etc/crontab -p wa -k tuning_vps_cron
 EOF
-
-# Применение правил auditd
-AUGENRULES_RESULT=0
-augenrules --load >/dev/null 2>&1 || AUGENRULES_RESULT=$?
-
-# Перезапуск auditd для применения правил
-systemctl restart auditd 2>/dev/null || true
-
-log "Правила аудита настроены"
-AUDIT_RULES_VALIDATION_OK=$AUGENRULES_RESULT
-if ! auditctl -l 2>/dev/null | grep -q "sshd_config"; then
-    AUDIT_RULES_VALIDATION_OK=1
 fi
-add_check $AUDIT_RULES_VALIDATION_OK "Настройка правил аудита"
+
+if [ -z "$AUDIT_FAILURE" ] && ! cmp -s "$AUDIT_RULES_NEW" "$AUDIT_RULES_CONFIG"; then
+    install -m 0640 "$AUDIT_RULES_NEW" "$AUDIT_RULES_CONFIG" ||
+        AUDIT_FAILURE="не удалось установить правила auditd"
+fi
+rm -f "$AUDIT_RULES_NEW"
+if [ -z "$AUDIT_FAILURE" ] && ! augenrules --load >/dev/null 2>&1; then
+    AUDIT_FAILURE="augenrules не применил правила auditd"
+fi
+if [ -z "$AUDIT_FAILURE" ] &&
+   { ! systemctl is-active --quiet auditd ||
+     ! auditctl -l 2>/dev/null | grep -q 'tuning_vps_ssh'; }; then
+    AUDIT_FAILURE="auditd не активен или управляемые правила не загружены"
+fi
+
+if [ -n "$AUDIT_FAILURE" ]; then
+    if [ "$AUDIT_RULES_EXISTED" = true ]; then
+        cp -p "$AUDIT_RULES_BACKUP" "$AUDIT_RULES_CONFIG" ||
+            error "Не удалось восстановить прежние правила auditd."
+    else
+        rm -f "$AUDIT_RULES_CONFIG"
+    fi
+    augenrules --load >/dev/null 2>&1 || true
+    add_result "FAIL" "Auditd privacy" "$AUDIT_FAILURE"
+else
+    add_result "OK" "Auditd privacy" "аудитируются только изменения административной конфигурации"
+fi
+rm -f "$AUDIT_RULES_BACKUP"
+
+# Внешние правила не трогаем, но предупреждаем, если они всё ещё пишут сетевую
+# активность. Это позволяет владельцу осознанно удалить их вне базового скрипта.
+AUDIT_NETWORK_RULES=$(auditctl -l 2>/dev/null | grep -E -- '(^|[[:space:]])-S[[:space:]]+(connect|accept)([[:space:]]|$)' || true)
+if [ -n "$AUDIT_NETWORK_RULES" ]; then
+    warn "Обнаружены внешние auditd-правила соединений; базовый скрипт их не удалял."
+    add_result "WARN" "Auditd privacy" "внешние правила продолжают аудит connect/accept"
+fi
 
 # 14. АВТООБНОВЛЕНИЯ ==========================================================
 
@@ -1602,65 +1734,159 @@ else
     add_result "FAIL" "Needrestart" "$NEEDRESTART_FAILURE"
 fi
 
-# 16. НАСТРОЙКА JOURNALD (ЦЕНТРАЛИЗОВАННЫЕ ЛОГИ) =================================
+# 16. JOURNALD: КОРОТКОЕ ХРАНЕНИЕ И ВРЕМЕННАЯ ДИАГНОСТИКА =====================
 
-log "Настройка journald (системный журнал)..."
+log "Настройка приватного journald..."
 
-JOURNALD_CONFIG="/etc/systemd/journald.conf"
-JOURNALD_BACKUP="${JOURNALD_CONFIG}.bak.$(date +%s)"
+# Конфигурация проекта хранится в drop-in, поэтому пакетный и провайдерский
+# journald.conf остаются нетронутыми. Семь дней и 50 MiB достаточны для SSH,
+# обновлений и диагностики ОС, но ограничивают последствия утечки диска.
+JOURNALD_CONFIG_DIR=/etc/systemd/journald.conf.d
+JOURNALD_CONFIG="$JOURNALD_CONFIG_DIR/99-tuning-vps-privacy.conf"
+JOURNALD_DEBUG_CONFIG="$JOURNALD_CONFIG_DIR/99-tuning-vps-debug.conf"
+JOURNALD_DEBUG_HELPER=/usr/local/sbin/tuning-vps-debug-logging
+JOURNALD_NEW=$(mktemp /etc/systemd/.tuning-vps-journald.XXXXXXXX) || exit 1
+JOURNALD_BACKUP=""
+JOURNALD_CONFIG_EXISTED=false
 JOURNALD_FAILURE=""
 JOURNALD_CHECK_SINCE=$(date --iso-8601=seconds)
-JOURNALD_CONFIG_EXISTED=false
+
 if [ -f "$JOURNALD_CONFIG" ]; then
+    JOURNALD_BACKUP=$(mktemp /etc/systemd/.tuning-vps-journald-backup.XXXXXXXX) || exit 1
+    cp -p "$JOURNALD_CONFIG" "$JOURNALD_BACKUP" || exit 1
     JOURNALD_CONFIG_EXISTED=true
-    cp "$JOURNALD_CONFIG" "$JOURNALD_BACKUP"
 fi
 
-cat > "$JOURNALD_CONFIG" << 'EOF'
+cat > "$JOURNALD_NEW" << 'EOF'
 [Journal]
+# Сохраняем системную диагностику, но не месяцы сетевой активности клиентов.
 Storage=persistent
-SystemMaxUse=500M
-SystemMaxFileSize=100M
-SystemMaxFiles=10
-RuntimeMaxUse=100M
-RuntimeMaxFileSize=10M
-RuntimeMaxFiles=5
 Compress=yes
-MaxRetentionSec=1month
-SyncIntervalSec=5m
+Seal=yes
+SystemMaxUse=50M
+SystemMaxFileSize=8M
+SystemMaxFiles=7
+SystemKeepFree=200M
+RuntimeMaxUse=20M
+RuntimeMaxFileSize=4M
+RuntimeMaxFiles=5
+MaxRetentionSec=7day
+# В обычном режиме отбрасываем debug-сообщения приложений.
+MaxLevelStore=info
+MaxLevelSyslog=info
 EOF
 
-mkdir -p /var/log/journal
-systemd-tmpfiles --create --prefix /var/log/journal >/dev/null 2>&1 || true
+if ! install -d -m 0755 "$JOURNALD_CONFIG_DIR"; then
+    JOURNALD_FAILURE="не удалось создать каталог drop-in journald"
+elif ! cmp -s "$JOURNALD_NEW" "$JOURNALD_CONFIG"; then
+    install -m 0644 "$JOURNALD_NEW" "$JOURNALD_CONFIG" ||
+        JOURNALD_FAILURE="не удалось установить управляемый drop-in journald"
+fi
+rm -f "$JOURNALD_NEW"
 
-if ! systemctl restart systemd-journald; then
+# Временный debug-режим включается одной командой и сам отключается максимум
+# через два часа. Базовый режим при этом сохраняет те же лимиты места и срока.
+if [ -z "$JOURNALD_FAILURE" ]; then
+    cat > "$JOURNALD_DEBUG_HELPER" << 'EOF'
+#!/usr/bin/env bash
+set -u
+
+config_dir=/etc/systemd/journald.conf.d
+debug_config="$config_dir/99-tuning-vps-debug.conf"
+expire_unit=tuning-vps-debug-logging-expire
+
+restart_journald() {
+    systemctl restart systemd-journald
+}
+
+case "${1:-status}" in
+    enable)
+        duration=${2:-30m}
+        case "$duration" in 5m|15m|30m|1h|2h) ;; *)
+            echo "Допустимая длительность: 5m, 15m, 30m, 1h или 2h" >&2
+            exit 2 ;;
+        esac
+        install -d -m 0755 "$config_dir"
+        cat > "$debug_config" <<'DEBUG_EOF'
+[Journal]
+MaxLevelStore=debug
+MaxLevelSyslog=debug
+DEBUG_EOF
+        if ! restart_journald; then
+            echo "Не удалось перезапустить systemd-journald; debug-режим не включён." >&2
+            rm -f "$debug_config"
+            exit 1
+        fi
+        systemctl stop "${expire_unit}.timer" >/dev/null 2>&1 || true
+        if ! systemd-run --quiet --collect --unit="$expire_unit" --on-active="$duration" \
+            /usr/local/sbin/tuning-vps-debug-logging disable; then
+            rm -f "$debug_config"
+            restart_journald || true
+            echo "Не удалось запланировать отключение debug-режима." >&2
+            exit 1
+        fi
+        echo "Подробные системные логи включены на $duration."
+        ;;
+    disable)
+        rm -f "$debug_config"
+        systemctl stop "${expire_unit}.timer" >/dev/null 2>&1 || true
+        if ! restart_journald; then
+            echo "Не удалось перезапустить systemd-journald после отключения debug-режима." >&2
+            exit 1
+        fi
+        echo "Подробные системные логи отключены."
+        ;;
+    status)
+        if [ -f "$debug_config" ]; then
+            echo "Подробные системные логи включены; проверьте ${expire_unit}.timer."
+        else
+            echo "Обычный приватный режим журналов активен."
+        fi
+        ;;
+    *)
+        echo "Использование: $0 {enable [5m|15m|30m|1h|2h]|disable|status}" >&2
+        exit 2 ;;
+esac
+EOF
+    chmod 0750 "$JOURNALD_DEBUG_HELPER" || JOURNALD_FAILURE="не удалось установить helper debug-логов"
+fi
+
+mkdir -p /var/log/journal
+if [ -z "$JOURNALD_FAILURE" ] && ! systemctl restart systemd-journald; then
     JOURNALD_FAILURE="не удалось перезапустить systemd-journald"
-elif ! systemctl is-active --quiet systemd-journald; then
+elif [ -z "$JOURNALD_FAILURE" ] && ! systemctl is-active --quiet systemd-journald; then
     JOURNALD_FAILURE="systemd-journald не активен после перезапуска"
-elif [ ! -d /var/log/journal ]; then
+elif [ -z "$JOURNALD_FAILURE" ] && [ ! -d /var/log/journal ]; then
     JOURNALD_FAILURE="persistent storage /var/log/journal отсутствует"
-elif journalctl -u systemd-journald --since "$JOURNALD_CHECK_SINCE" --no-pager 2>/dev/null | grep -qiE 'unknown key|invalid|failed|error'; then
+elif [ -z "$JOURNALD_FAILURE" ] &&
+     journalctl -u systemd-journald --since "$JOURNALD_CHECK_SINCE" --no-pager 2>/dev/null | grep -qiE 'unknown key|invalid|failed|error'; then
     JOURNALD_FAILURE="journald сообщил об ошибке или неизвестной директиве"
-else
+elif [ -z "$JOURNALD_FAILURE" ]; then
     JOURNALD_EFFECTIVE=$(systemd-analyze cat-config systemd/journald.conf 2>/dev/null)
     if ! grep -qx 'Storage=persistent' <<< "$JOURNALD_EFFECTIVE" || \
-       ! grep -qx 'SystemMaxUse=500M' <<< "$JOURNALD_EFFECTIVE"; then
+       ! grep -qx 'SystemMaxUse=50M' <<< "$JOURNALD_EFFECTIVE" || \
+       ! grep -qx 'MaxRetentionSec=7day' <<< "$JOURNALD_EFFECTIVE" || \
+       ! grep -qx 'MaxLevelStore=info' <<< "$JOURNALD_EFFECTIVE"; then
         JOURNALD_FAILURE="итоговая конфигурация не содержит ожидаемых значений"
     fi
 fi
 
 if [ -z "$JOURNALD_FAILURE" ]; then
+    journalctl --vacuum-time=7d --vacuum-size=50M >/dev/null 2>&1 ||
+        warn "Не удалось немедленно сократить старые журналы journald."
     JOURNAL_SIZE=$(journalctl --disk-usage 2>/dev/null | head -1 || echo "размер недоступен")
-    add_result "OK" "Journald" "persistent storage активен, лимит 500M; $JOURNAL_SIZE"
+    add_result "OK" "Journald privacy" "хранение до 7 дней и 50M; $JOURNAL_SIZE; debug: sudo tuning-vps-debug-logging enable 30m"
 else
     if [ "$JOURNALD_CONFIG_EXISTED" = true ]; then
-        cp "$JOURNALD_BACKUP" "$JOURNALD_CONFIG"
+        cp -p "$JOURNALD_BACKUP" "$JOURNALD_CONFIG" ||
+            error "Не удалось восстановить прежний drop-in journald."
     else
         rm -f "$JOURNALD_CONFIG"
     fi
     systemctl restart systemd-journald >/dev/null 2>&1 || true
-    add_result "FAIL" "Journald" "$JOURNALD_FAILURE; исходный конфиг восстановлен"
+    add_result "FAIL" "Journald privacy" "$JOURNALD_FAILURE; управляемый drop-in восстановлен"
 fi
+rm -f "$JOURNALD_BACKUP"
 
 # 17. НАСТРОЙКА ЛОГРОТАЦИИ =====================================================
 
@@ -2008,17 +2234,48 @@ if [ "$DOCKER_STATE" = "not-installed" ]; then
         apt-get update -qq || DOCKER_INSTALL_OK=false
         apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin || DOCKER_INSTALL_OK=false
 
-        # Добавляем пользователя в группу docker
-        usermod -aG docker "$NEW_USER" || DOCKER_INSTALL_OK=false
+        # Лимит задаётся до первого запуска Docker, поэтому новые контейнеры
+        # сразу получают bounded local logs. Чужой daemon здесь ещё не работает.
+        if [ "$DOCKER_INSTALL_OK" = true ] && ! configure_docker_logging; then
+            DOCKER_INSTALL_OK=false
+            warn "Не удалось настроить ограничение Docker-логов: $DOCKER_LOGGING_CONFLICT"
+        elif [ "$DOCKER_INSTALL_OK" = true ]; then
+            DOCKER_LOGGING_CONFIGURED_DURING_INSTALL=true
+        fi
 
-        # Запускаем Docker (с обработкой ошибок)
+        # Группа docker даёт эквивалент root-доступа через Docker socket. Не
+        # выдаём её автоматически: владелец должен явно решить, нужен ли
+        # user1 локальный Docker без sudo для будущих модулей приложений.
+        if [ "$DOCKER_INSTALL_OK" = true ]; then
+            read -r -p "Разрешить $NEW_USER управлять Docker без sudo? Это даёт права уровня root. (y/N): " docker_user_access
+            if [ "$docker_user_access" = "y" ] || [ "$docker_user_access" = "Y" ]; then
+                if usermod -aG docker "$NEW_USER"; then
+                    DOCKER_USER_ACCESS="granted"
+                else
+                    DOCKER_INSTALL_OK=false
+                    DOCKER_USER_ACCESS="failed"
+                fi
+            else
+                DOCKER_USER_ACCESS="not-granted"
+            fi
+        fi
+
+        # Пакет мог запустить daemon ещё до записи daemon.json. При первой
+        # установке контейнеров ещё нет, поэтому restart безопасно применяет
+        # политику логов до первого пользовательского контейнера.
         log "Запуск Docker сервиса..."
-        if [ "$DOCKER_INSTALL_OK" = true ] && systemctl enable docker 2>/dev/null && systemctl start docker 2>/dev/null; then
+        if [ "$DOCKER_INSTALL_OK" = true ] && systemctl enable docker 2>/dev/null && systemctl restart docker 2>/dev/null; then
             sleep 2
             detect_docker_state
             if [ "$DOCKER_STATE" = "installed-running" ]; then
+                DOCKER_LOGGING_CHANGED=false
                 log "Docker установлен: $(docker --version)"
                 add_result "OK" "Docker" "установлен и запущен"
+                if [ "$DOCKER_USER_ACCESS" = "granted" ]; then
+                    add_result "WARN" "Docker access" "$NEW_USER добавлен в группу docker; новый login получит права уровня root"
+                elif [ "$DOCKER_USER_ACCESS" = "not-granted" ]; then
+                    add_result "OK" "Docker access" "$NEW_USER не добавлен в группу docker; используйте sudo для Docker"
+                fi
             else
                 warn "Docker установлен, но не запущен. Попробуйте перезагрузить сервер."
                 add_result "WARN" "Docker" "установлен, но daemon недоступен"
@@ -2049,6 +2306,15 @@ else
     fi
 fi
 
+# На существующей установке меняем только совместимую политику. Docker намеренно
+# не перезапускается при повторном запуске базы: это может остановить контейнеры.
+if [ "$DOCKER_STATE" = "installed-running" ] || [ "$DOCKER_STATE" = "installed-stopped" ]; then
+    if [ "$DOCKER_LOGGING_CONFIGURED_DURING_INSTALL" != true ] && ! configure_docker_logging; then
+        warn "Ограничение Docker-логов не изменено: $DOCKER_LOGGING_CONFLICT"
+    fi
+    report_docker_logging_policy
+fi
+
 # UFW видит обычные процессы, но Docker может добавлять собственные firewall
 # правила. Перед установкой приложений показываем только факт публикации портов.
 if [ "$DOCKER_STATE" = "installed-running" ]; then
@@ -2056,6 +2322,10 @@ if [ "$DOCKER_STATE" = "installed-running" ]; then
 fi
 
 # 22. УСТАНОВКА MTPROTO PROXY (ОПЦИОНАЛЬНО)
+
+# Удаляем только временные файлы прежних версий проекта. Работающий контейнер
+# это не затрагивает, а секрет больше не остаётся доступным через общий /tmp.
+rm -f /tmp/mtproto_secret.txt /tmp/mtproto_implementation.txt
 
 # MTProto можно устанавливать только через проверенный работающий Docker daemon.
 if [ "$DOCKER_STATE" != "skipped" ] && [ "$DOCKER_STATE" != "installation-failed" ]; then
@@ -2117,11 +2387,9 @@ if [ "$DOCKER_STATE" = "installed-running" ]; then
         fi
 
         if [ -n "$SECRET" ]; then
-            log "Секрет сгенерирован: $SECRET"
-
-            # Сохраняем секрет и реализацию для финального отчёта.
-            echo "$SECRET" > /tmp/mtproto_secret.txt
-            echo "$MTPROTO_IMPLEMENTATION" > /tmp/mtproto_implementation.txt
+            # Секрет выводится владельцу один раз после успешного запуска, но
+            # не пишется в log(), /tmp и финальный отчёт повторного запуска.
+            log "Секрет сгенерирован. Он будет показан после проверки контейнера."
 
             # Единое имя контейнера и порт исключают одновременную работу двух реализаций.
             docker stop mtproto-proxy &>/dev/null || true
@@ -2204,38 +2472,16 @@ echo ""
 echo "Опциональные компоненты:"
 echo "  Docker: $DOCKER_STATE"
 echo "  MTProto: $MTPROTO_STATE${MTPROTO_IMPLEMENTATION:+ ($MTPROTO_IMPLEMENTATION)}"
-# Информация о MTProto в финальном отчете
+# Базовый сценарий не извлекает секрет из Docker-логов и не печатает ссылку
+# повторно: это защищает уже работающий устаревший сервис до его удаления в M7.
 if [ "$DOCKER_STATE" = "installed-running" ] && docker ps --format '{{.Names}}' 2>/dev/null | grep -qx mtproto-proxy; then
-    # Пытаемся получить секрет из сохранённого файла или из логов
-    MTPROTO_SECRET=""
-    if [ -f /tmp/mtproto_secret.txt ]; then
-        MTPROTO_SECRET=$(cat /tmp/mtproto_secret.txt)
-    fi
-    
-    # Если файл пустой, пробуем извлечь из логов Docker
-    if [ -z "$MTPROTO_SECRET" ]; then
-        MTPROTO_SECRET=$(docker logs mtproto-proxy 2>&1 | grep -oP '[a-f0-9]{64}' | head -1)
-    fi
-    
     echo ""
     echo "MTProto Proxy активен:"
     echo "----------------------"
     echo -e "  Статус: ${GREEN}запущен${NC}"
-    if [ -f /tmp/mtproto_implementation.txt ]; then
-        echo "  Реализация: $(cat /tmp/mtproto_implementation.txt)"
-    fi
     echo "  Порт: 443"
     echo "  IP: $SERVER_IP"
-    if [ -n "$MTPROTO_SECRET" ]; then
-        echo "  Секрет: $MTPROTO_SECRET"
-        echo ""
-        echo "  Поделиться ссылкой:"
-        echo -e "  ${YELLOW}https://t.me/proxy?server=$SERVER_IP&port=443&secret=$MTPROTO_SECRET${NC}"
-    else
-        echo ""
-        echo "  Секрет: (не удалось получить автоматически)"
-        echo "  Получите секрет вручную: docker logs mtproto-proxy"
-    fi
+    echo "  Секрет и ссылка не выводятся повторно и не извлекаются из журналов."
 fi
 echo ""
 echo "===НАСТРОЙКА ЗАВЕРШЕНА==="

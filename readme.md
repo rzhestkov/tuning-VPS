@@ -19,11 +19,11 @@ sudo fail2ban-client status sshd
 
 # Auditd
 sudo systemctl status auditd
-sudo auditctl -l | grep sshd_config
+sudo auditctl -l | grep tuning_vps_
 
 # Автообновления
 systemctl list-timers apt-daily.timer apt-daily-upgrade.timer
-sudo grep -E "Allowed-Origins|Automatic-Reboot" /etc/apt/apt.conf.d/50unattended-upgrades
+sudo grep -E "Allowed-Origins|Automatic-Reboot" /etc/apt/apt.conf.d/99-tuning-vps-auto-upgrades
 
 # Needrestart
 sudo grep "nrconf{restart}" /etc/needrestart/needrestart.conf
@@ -31,7 +31,8 @@ sudo grep "nrconf{restart}" /etc/needrestart/needrestart.conf
 # Journald
 sudo systemctl status systemd-journald
 sudo journalctl --disk-usage
-sudo grep -E "^(Storage|SystemMaxUse)" /etc/systemd/journald.conf
+sudo systemd-analyze cat-config systemd/journald.conf | grep -E "^(Storage|SystemMaxUse|MaxRetentionSec|MaxLevelStore)"
+sudo tuning-vps-debug-logging status
 
 # Logrotate
 sudo logrotate -d /etc/logrotate.d/custom-system
@@ -149,10 +150,10 @@ ssh -4 -p 2332 user1@SERVER_IP
 | **07. Ограничения ресурсов** | Управляемая секция в `/etc/security/limits.conf` только для `user1`           | Проверяет реальные лимиты в login-сессии пользователя, при ошибке восстанавливает конфиг                                 |
 | **08–11. SSH и UFW**          | Проверяет ключи, добавляет управляемый SSH-файл и настраивает UFW              | Добавляет только SSH, сохраняет внешние правила и выводит их в отчёте                                                    |
 | **12. Fail2ban**             | Защита SSH от брутфорса                                                       | 3 попытки, бан на 1 час, настроен на кастомный порт SSH                                                                  |
-| **13. Auditd**               | Аудит действий на сервере                                                     | Логирование изменений системных файлов, SSH конфигурации                                                                 |
+| **13. Auditd**               | Аудит административной конфигурации                                          | Пароли, sudo, SSH, APT, systemd и cron; без постоянного аудита пользовательских соединений                              |
 | **14. Автообновления**       | Создаёт `/etc/apt/apt.conf.d/99-tuning-vps-auto-upgrades`                     | Ежедневные обычные и security-обновления Ubuntu, reboot в 03:00, проверка `apt-config`, timers и worker                  |
 | **15. Needrestart**          | Настраивает основной `/etc/needrestart/needrestart.conf`                      | Проверяет синтаксис Perl и фактически загруженное значение                                                               |
-| **16. Journald**             | Настраивает основной `/etc/systemd/journald.conf`                             | Persistent storage, лимит 500МБ, проверка поддерживаемых директив и журнала ошибок                                       |
+| **16. Journald**             | Создаёт drop-in `/etc/systemd/journald.conf.d/99-tuning-vps-privacy.conf`    | Persistent storage, 7 дней/50M и отдельный временный переключатель debug-логов                                           |
 | **17. Logrotate**            | Настраивает ротацию логов                                                     | Ежедневная ротация, 7 копий, сжатие для системных логов                                                                  |
 | **18. MOTD**                 | Статическое сообщение из `/etc/motd`                                          | Статический MOTD подключён через PAM, динамический MOTD отключён                                                         |
 | **19. SSH-audit**            | Проверка SSH конфигурации                                                     | Анализ безопасности SSH с помощью ssh-audit                                                                              |
@@ -192,6 +193,24 @@ ssh -4 -p 2332 user1@SERVER_IP
 Если на сервере уже есть разрешающие правила UFW, скрипт сохраняет их и показывает в итоговом отчёте. В частности, правило 22/tcp, созданное хостером или ранее вручную, не удаляется автоматически; после перехода на 2332 SSH на 22 уже не слушает, но правило следует отдельно проверить и убрать вручную, если оно больше не нужно.
 
 Docker может публиковать порты через свой firewall backend, поэтому опубликованный контейнерный порт может быть доступен извне независимо от правил UFW. Скрипт показывает такие контейнеры и порты без вывода журналов и секретов. Для новых приложений предпочитайте привязку к 127.0.0.1 либо явно задавайте политику в цепочке DOCKER-USER; после публикации порта всегда проверяйте доступ с другой машины.
+
+### Приватность журналов
+
+База хранит системный journal не дольше 7 дней и не больше 50 MiB. В обычном режиме сохраняются сообщения уровня `info` и выше: этого достаточно для диагностики SSH, обновлений и состояния ОС, без постоянного подробного журнала приложений.
+
+Правила проекта для auditd фиксируют изменения административной конфигурации: учётных данных, sudo, SSH, APT, systemd и cron. Они не добавляют аудит `connect`/`accept`, DNS-запросов, VPN-клиентов или адресов назначения. Незнакомые внешние правила auditd не удаляются; если среди них есть аудит сетевых соединений, итоговый отчёт предупреждает об этом.
+
+Подробный системный журнал включается только на ограниченное время и затем сам отключается:
+
+```bash
+sudo tuning-vps-debug-logging enable 30m
+sudo tuning-vps-debug-logging status
+sudo tuning-vps-debug-logging disable
+```
+
+Допустимая длительность: `5m`, `15m`, `30m`, `1h` или `2h`. Переключатель меняет только уровень journald, не снимает ограничение срока и объёма хранения.
+
+Для новых Docker-контейнеров базовый `daemon.json` задаёт драйвер `local` и ротацию `10m` × 3. Изменение не перезапускает уже работающий Docker и поэтому применяется к нему после планового перезапуска daemon; настройки уже созданных контейнеров нужно проверять отдельно. Модули приложений не должны записывать ключи, ссылки подключения, IP-адреса клиентов и адреса назначения в журналы или общедоступные временные файлы.
 
 ### Sysctl и будущий VPN
 
@@ -246,6 +265,8 @@ sudo ufw status verbose
 docker --version
 sudo -u user1 docker ps
 docker ps --format 'table {{.Names}}\t{{.Ports}}'
+docker info --format '{{.LoggingDriver}}'
+sudo cat /etc/docker/daemon.json
 
 # Проверка автоматических обновлений
 apt-config dump | grep -E '^(APT::Periodic::(Update-Package-Lists|Unattended-Upgrade)|Unattended-Upgrade::Allowed-Origins::|Unattended-Upgrade::Automatic-Reboot)'
@@ -263,6 +284,8 @@ sudo systemctl status systemd-timesyncd
 # Проверка journald (системный журнал)
 sudo journalctl --disk-usage
 sudo systemctl status systemd-journald
+sudo systemd-analyze cat-config systemd/journald.conf | grep -E "^(Storage|SystemMaxUse|MaxRetentionSec|MaxLevelStore)"
+sudo tuning-vps-debug-logging status
 
 # Проверка logrotate
 sudo logrotate -d /etc/logrotate.d/custom-system
