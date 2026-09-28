@@ -373,17 +373,21 @@ fi
 # защищённом сервере не должен сначала что-то изменить, а потом требовать порт 22.
 SSHD_CONFIG=/etc/ssh/sshd_config
 SSH_MANAGED_CONFIG=/etc/ssh/tuning-vps.conf
+# Ubuntu 24.04 images may use systemd socket activation for SSH.  In that
+# mode ssh.socket owns the listening ports, while sshd_config still owns the
+# authentication policy.  Keep the project override separate from both the
+# vendor unit and any provider drop-ins.
+SSH_SOCKET_MANAGED_DIR=/etc/systemd/system/ssh.socket.d
+SSH_SOCKET_MANAGED_CONFIG="$SSH_SOCKET_MANAGED_DIR/99-tuning-vps.conf"
 ssh_port_listening() {
     ss -4 -H -ltn 2>/dev/null | awk -v port="$1" '
         { endpoint=$4; sub(/^.*:/, "", endpoint); if (endpoint == port) found=1 }
         END { exit !found }
     '
 }
-ssh_service_port_listening() {
-    # После переключения на ssh.service порт должен принадлежать самому sshd,
-    # а не постороннему процессу с тем же номером.
-    ss -4 -H -ltnp 2>/dev/null | awk -v port="$1" '
-        { endpoint=$4; sub(/^.*:/, "", endpoint); if (endpoint == port && /"sshd"/) found=1 }
+ssh_ipv6_port_listening() {
+    ss -6 -H -ltn 2>/dev/null | awk -v port="$1" '
+        { endpoint=$4; sub(/^.*:/, "", endpoint); if (endpoint == port) found=1 }
         END { exit !found }
     '
 }
@@ -413,28 +417,44 @@ ssh_unit_is_stopped() {
     state=$(systemctl is-active "$1" 2>/dev/null || true)
     [ "$state" = inactive ] || [ "$state" = failed ]
 }
+ssh_socket_unit_exists() {
+    local state
+    state=$(systemctl show -p LoadState --value ssh.socket 2>/dev/null || true)
+    [ -n "$state" ] && [ "$state" != not-found ]
+}
 
-# Switch from either service or socket activation to ssh.service. A failed
-# socket unit is reset explicitly, because systemd otherwise treats it as a
-# failed dependency for ssh.service on the next attempt.
+# Some hosting images do not provide ssh.socket.  For them, switch to the
+# ordinary ssh.service path after stopping an inherited listener.  Do not call
+# this helper when ssh.socket exists: enabling ssh.service can pull its socket
+# dependency back and make the vendor port 22 listen again.
 stop_socket_activated_ssh_listener() {
-    systemctl disable ssh.socket >/dev/null 2>&1 || return 1
-    systemctl stop ssh.socket >/dev/null 2>&1 ||
-        ssh_unit_is_stopped ssh.socket || return 1
+    ssh_socket_unit_exists && return 1
     systemctl stop ssh.service >/dev/null 2>&1 ||
         ssh_unit_is_stopped ssh.service || return 1
     stop_sshd_listeners_on_port "$SSH_ORIGINAL_PORT" || {
         error "Не удалось остановить SSH listener на порту $SSH_ORIGINAL_PORT."
         return 1
     }
+}
+# Apply a prepared ssh.socket drop-in and then restart the socket before sshd.
+# Restarting sshd is intentional: an already running daemon retains copies of
+# old activation descriptors, so a reload alone could leave the old port open.
+apply_socket_activated_ssh() {
+    local config=$1
+    install -d -m 755 "$SSH_SOCKET_MANAGED_DIR" || return 1
+    install -m 644 "$config" "$SSH_SOCKET_MANAGED_CONFIG" || return 1
+    systemctl daemon-reload || return 1
     systemctl reset-failed ssh.socket >/dev/null 2>&1 || return 1
+    systemctl enable ssh.socket >/dev/null 2>&1 || return 1
+    systemctl restart ssh.socket || return 1
+    systemctl restart ssh.service || return 1
 }
 restore_socket_activated_ssh() {
-    systemctl stop ssh.service >/dev/null 2>&1 ||
-        ssh_unit_is_stopped ssh.service || return 1
-    stop_sshd_listeners_on_port "$SSH_PORT" || return 1
+    ssh_socket_unit_exists || return 1
+    systemctl daemon-reload || return 1
     systemctl reset-failed ssh.socket >/dev/null 2>&1 || return 1
-    systemctl start ssh.socket >/dev/null 2>&1
+    systemctl restart ssh.socket || return 1
+    systemctl restart ssh.service
 }
 ssh_context_value() {
     local user=$1 port=$2 option=$3
@@ -1000,12 +1020,14 @@ SSH_CHANGED=false
 SSH_COMMITTED=false
 SSH_ROLLBACK_NEEDED=false
 SSH_CONFIG_TOUCHED=false
+SSH_SOCKET_CONFIG_TOUCHED=false
 SSH_KEYS_TOUCHED=false
 SSH_SYSTEMD_TOUCHED=false
 SSH_ROOT_TOUCHED=false
 SSH_ORIGINAL_KEYS=false
 SSH_ORIGINAL_DIR=false
 SSH_ORIGINAL_MANAGED=false
+SSH_ORIGINAL_SOCKET_MANAGED=false
 SSH_ORIGINAL_UFW=false
 SSH_ORIGINAL_UFW_DEFAULT=false
 SSH_ORIGINAL_UFW_RULES=false
@@ -1024,6 +1046,15 @@ restore_ssh_state() {
             cp -p "$SSH_WORK/original-managed" "$SSH_MANAGED_CONFIG" || failed=true
         else
             rm -f "$SSH_MANAGED_CONFIG" || failed=true
+        fi
+    fi
+    if [ "$SSH_SOCKET_CONFIG_TOUCHED" = true ]; then
+        if [ "$SSH_ORIGINAL_SOCKET_MANAGED" = true ]; then
+            install -d -m 755 "$SSH_SOCKET_MANAGED_DIR" || failed=true
+            cp -p "$SSH_WORK/original-socket-managed" "$SSH_SOCKET_MANAGED_CONFIG" || failed=true
+        else
+            rm -f "$SSH_SOCKET_MANAGED_CONFIG" || failed=true
+            rmdir "$SSH_SOCKET_MANAGED_DIR" 2>/dev/null || true
         fi
     fi
     if [ "$SSH_KEYS_TOUCHED" = true ]; then
@@ -1054,20 +1085,24 @@ restore_ssh_state() {
     fi
     sshd -t >/dev/null 2>&1 || failed=true
     if [ "$SSH_SYSTEMD_TOUCHED" = true ]; then
-        if [ "$SSH_SOCKET_WAS_ENABLED" = enabled ]; then
-            systemctl enable ssh.socket >/dev/null 2>&1 || failed=true
-        elif [ "$SSH_SOCKET_WAS_ENABLED" = disabled ]; then
-            systemctl disable ssh.socket >/dev/null 2>&1 || failed=true
+        if [ "$SSH_SOCKET_EXISTS" = true ]; then
+            if [ "$SSH_SOCKET_WAS_ENABLED" = enabled ]; then
+                systemctl enable ssh.socket >/dev/null 2>&1 || failed=true
+            elif [ "$SSH_SOCKET_WAS_ENABLED" = disabled ]; then
+                systemctl disable ssh.socket >/dev/null 2>&1 || failed=true
+            fi
         fi
         if [ "$SSH_SERVICE_WAS_ENABLED" = enabled ]; then
             systemctl enable ssh.service >/dev/null 2>&1 || failed=true
         elif [ "$SSH_SERVICE_WAS_ENABLED" = disabled ]; then
             systemctl disable ssh.service >/dev/null 2>&1 || failed=true
         fi
-    if [ "$SSH_SOCKET_WAS_ACTIVE" = active ]; then
+        if [ "$SSH_SOCKET_EXISTS" = true ] && [ "$SSH_SOCKET_WAS_ACTIVE" = active ]; then
             restore_socket_activated_ssh || failed=true
         else
-            systemctl stop ssh.socket >/dev/null 2>&1 || true
+            if [ "$SSH_SOCKET_EXISTS" = true ]; then
+                systemctl stop ssh.socket >/dev/null 2>&1 || true
+            fi
             systemctl restart ssh.service >/dev/null 2>&1 || failed=true
         fi
     fi
@@ -1139,11 +1174,21 @@ if [ -e "$SSH_MANAGED_CONFIG" ]; then
     cp -p "$SSH_MANAGED_CONFIG" "$SSH_WORK/original-managed" || exit 1
     SSH_ORIGINAL_MANAGED=true
 fi
+if [ -e "$SSH_SOCKET_MANAGED_CONFIG" ]; then
+    cp -p "$SSH_SOCKET_MANAGED_CONFIG" "$SSH_WORK/original-socket-managed" || exit 1
+    SSH_ORIGINAL_SOCKET_MANAGED=true
+fi
 SSH_ORIGINAL_PORT=${CURRENT_SSH_PORT:-22}
 [ "$SSH_ACCESS_MODE" != final ] || SSH_ORIGINAL_PORT=$SSH_PORT
 SSH_ROOT_HASH_BEFORE=$(getent shadow root | cut -d: -f2)
-SSH_SOCKET_WAS_ACTIVE=$(systemctl is-active ssh.socket 2>/dev/null || true)
-SSH_SOCKET_WAS_ENABLED=$(systemctl is-enabled ssh.socket 2>/dev/null || true)
+SSH_SOCKET_EXISTS=false
+SSH_SOCKET_WAS_ACTIVE=""
+SSH_SOCKET_WAS_ENABLED=""
+if ssh_socket_unit_exists; then
+    SSH_SOCKET_EXISTS=true
+    SSH_SOCKET_WAS_ACTIVE=$(systemctl is-active ssh.socket 2>/dev/null || true)
+    SSH_SOCKET_WAS_ENABLED=$(systemctl is-enabled ssh.socket 2>/dev/null || true)
+fi
 SSH_SERVICE_WAS_ENABLED=$(systemctl is-enabled ssh.service 2>/dev/null || true)
 
 # Удаляем только собственную строку Include, если она уже была установлена.
@@ -1171,6 +1216,22 @@ AuthorizedKeysCommand none
 PermitRootLogin no
 PermitEmptyPasswords no
 EOF
+# socket activation receives listening descriptors from systemd, so Port and
+# AddressFamily above do not by themselves control the open TCP sockets.  An
+# empty ListenStream resets all vendor entries, including an IPv6 :22 entry.
+cat > "$SSH_WORK/temporary-socket-managed" << EOF
+# Managed by setup_ubuntu_24.04.sh: keep recovery access while testing the key.
+[Socket]
+ListenStream=
+ListenStream=0.0.0.0:22
+ListenStream=0.0.0.0:$SSH_PORT
+EOF
+cat > "$SSH_WORK/final-socket-managed" << EOF
+# Managed by setup_ubuntu_24.04.sh: IPv4 SSH only after key confirmation.
+[Socket]
+ListenStream=
+ListenStream=0.0.0.0:$SSH_PORT
+EOF
 if ssh_unsafe_match_auth; then
     error "Автоматическое применение SSH-политики остановлено до изменения доступа."
     exit 1
@@ -1197,8 +1258,10 @@ if ! cmp -s "$SSH_WORK/runtime-main" "$SSHD_CONFIG" ||
    ! cmp -s "$SSH_WORK/final-managed" "$SSH_MANAGED_CONFIG"; then
     SSH_CONFIG_CHANGED=true
 fi
-if [ "$SSH_SOCKET_WAS_ACTIVE" = active ] || [ "$SSH_SOCKET_WAS_ENABLED" = enabled ]; then
-    # Даже при тех же директивах socket может вернуть старый listener при reboot.
+if [ "$SSH_SOCKET_EXISTS" = true ] &&
+   ! cmp -s "$SSH_WORK/final-socket-managed" "$SSH_SOCKET_MANAGED_CONFIG"; then
+    # Socket configuration is part of the SSH policy: without this check a
+    # rerun could leave a provider's port 22 listener enabled after reboot.
     SSH_CONFIG_CHANGED=true
 fi
 if [ "$SSH_ACCESS_MODE" = transition ]; then
@@ -1264,8 +1327,8 @@ if [ "$SSH_ACCESS_MODE" = transition ]; then
 fi
 
 # Временный перезапуск добавляет новый порт, сохраняя исходный способ входа.
-# При ssh.socket переключаемся на ssh.service: socket может удерживать порт 22
-# независимо от sshd_config. Любая ошибка вызывает trap и полный откат.
+# Для ssh.socket меняется его собственный listener, для обычных образов —
+# ssh.service. Любая ошибка вызывает trap и полный откат.
 if [ "$SSH_ACCESS_MODE" = transition ] || [ "$SSH_CHANGED" = true ]; then
     SSH_KEYS_TOUCHED=true
     install -d -m 700 -o "$NEW_USER" -g "$SSH_PRIMARY_GROUP" "$SSH_DIR" || exit 1
@@ -1277,14 +1340,31 @@ if [ "$SSH_ACCESS_MODE" = transition ]; then
     render_main_with_managed_include "$SSH_WORK/original-main" "$SSH_MANAGED_CONFIG" "$SSHD_CONFIG"
     sshd -t || exit 1
     SSH_SYSTEMD_TOUCHED=true
-    # Do this even if ssh.socket is currently failed: it may have left a
-    # listener behind after an earlier interrupted migration.
-    stop_socket_activated_ssh_listener || exit 1
-    systemctl enable ssh.service >/dev/null 2>&1 || exit 1
-    systemctl restart ssh.service || exit 1
+    if [ "$SSH_SOCKET_EXISTS" = true ]; then
+        SSH_SOCKET_CONFIG_TOUCHED=true
+        if ! apply_socket_activated_ssh "$SSH_WORK/temporary-socket-managed"; then
+            error "Не удалось применить временный listener ssh.socket."
+            systemctl status ssh.service ssh.socket --no-pager -l 2>&1 || true
+            systemctl show ssh.socket -p Listen -p ActiveState --no-pager 2>&1 || true
+            exit 1
+        fi
+    elif ! stop_socket_activated_ssh_listener; then
+        error "Не удалось подготовить ssh.service для временного перехода."
+        systemctl status ssh.service ssh.socket --no-pager -l 2>&1 || true
+        exit 1
+    elif ! systemctl enable ssh.service >/dev/null 2>&1; then
+        error "Не удалось включить ssh.service для временного перехода."
+        systemctl status ssh.service --no-pager -l 2>&1 || true
+        exit 1
+    elif ! systemctl restart ssh.service; then
+        error "Не удалось перезапустить ssh.service для временного перехода."
+        systemctl status ssh.service ssh.socket --no-pager -l 2>&1 || true
+        exit 1
+    fi
     sleep 2
-    ssh_service_port_listening 22 && ssh_service_port_listening "$SSH_PORT" ||
-        { error "После временного перехода оба SSH-порта не слушаются"; exit 1; }
+    ssh_port_listening 22 && ssh_port_listening "$SSH_PORT" &&
+        ! ssh_ipv6_port_listening 22 && ! ssh_ipv6_port_listening "$SSH_PORT" ||
+        { error "После временного перехода SSH не слушает оба IPv4-порта без IPv6 listener."; exit 1; }
     ssh_candidate_valid "$SSHD_CONFIG" temporary ||
         { error "Временная конфигурация SSH не прошла повторную проверку"; exit 1; }
 fi
@@ -1324,13 +1404,23 @@ fi
 sshd -t || exit 1
 if [ "$SSH_ACCESS_MODE" = transition ] || [ "$SSH_CONFIG_CHANGED" = true ]; then
     SSH_SYSTEMD_TOUCHED=true
-    systemctl disable --now ssh.socket >/dev/null 2>&1 || exit 1
-    systemctl enable ssh.service >/dev/null 2>&1 || exit 1
-    systemctl restart ssh.service || exit 1
+    if [ "$SSH_SOCKET_EXISTS" = true ]; then
+        SSH_SOCKET_CONFIG_TOUCHED=true
+        if ! apply_socket_activated_ssh "$SSH_WORK/final-socket-managed"; then
+            error "Не удалось применить финальный listener ssh.socket."
+            systemctl status ssh.service ssh.socket --no-pager -l 2>&1 || true
+            systemctl show ssh.socket -p Listen -p ActiveState --no-pager 2>&1 || true
+            exit 1
+        fi
+    else
+        systemctl enable ssh.service >/dev/null 2>&1 || exit 1
+        systemctl restart ssh.service || exit 1
+    fi
 fi
 sleep 2
-ssh_service_port_listening "$SSH_PORT" && ! ssh_port_listening 22 ||
-    { error "Финальное состояние SSH listener не подтверждено"; exit 1; }
+ssh_port_listening "$SSH_PORT" && ! ssh_port_listening 22 &&
+    ! ssh_ipv6_port_listening "$SSH_PORT" && ! ssh_ipv6_port_listening 22 ||
+    { error "Финальное состояние IPv4-only SSH listener не подтверждено"; exit 1; }
 ssh_candidate_valid "$SSHD_CONFIG" final ||
     { error "Финальная конфигурация SSH не прошла проверку"; exit 1; }
 if [ "$SSH_ACCESS_MODE" = transition ] ||
