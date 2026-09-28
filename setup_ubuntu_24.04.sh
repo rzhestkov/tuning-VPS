@@ -12,6 +12,14 @@ GITHUB_USER="rzhestkov"
 REPO_NAME="tuning-VPS"
 SSH_KEY_URL="https://raw.githubusercontent.com/${GITHUB_USER}/${REPO_NAME}/main/ssh/authorized_keys"
 
+# Интерактивные средства для ручной диагностики и настройки VPS. Они не
+# запускают службы в фоне; список установлен явно, чтобы не зависеть от образа
+# конкретного хостера и не превращать финальный отчёт в перечень случайных пакетов.
+ADMIN_TOOLS=(
+    mc tmux nano htop ncdu lsof jq ripgrep dnsutils netcat-openbsd rsync
+    curl wget git
+)
+
 # Получение IPv4 сервера (один раз в начале скрипта)
 SERVER_IP=$(
     curl -4 -fsS --max-time 5 ifconfig.me 2>/dev/null ||
@@ -511,13 +519,16 @@ apt-get update -qq
 apt-get upgrade -y -qq
 UPDATE_RESULT=$?
 
-# Установка mc если не установлен
-if ! command -v mc &>/dev/null; then
-    log "Установка mc..."
-    apt-get install -y -qq mc
+# Набор нужен для ручного обслуживания после завершения скрипта. apt сам
+# пропускает уже установленные версии, поэтому повторный запуск безопасен.
+log "Установка инструментов администрирования..."
+if ! apt-get install -y -qq "${ADMIN_TOOLS[@]}"; then
+    error "Не удалось установить набор инструментов администрирования"
+    exit 1
 fi
 
 add_check $UPDATE_RESULT "Обновление системы"
+add_result "OK" "Admin tools" "mc, tmux, nano, htop, ncdu, lsof, jq, ripgrep, DNS, TCP и rsync"
 
 # 03. ОТКЛЮЧЕНИЕ НЕНУЖНЫХ СИСТЕМНЫХ СЕРВИСОВ ==================================
 
@@ -2153,14 +2164,14 @@ echo "  4. Логи SSH: sudo journalctl -u ssh -n 50"
 echo ""
 log "Настройка завершена!"
 
-# Проверка предустановленных пакетов
+# Проверка компонентов, которыми управляет базовый сценарий. Не показываем
+# веб-серверы, базы и runtime приложений: их установка принадлежит модулям.
 echo ""
-echo "===ПРОВЕРКА ПРЕДУСТАНОВЛЕННЫХ ПАКЕТОВ==="
+echo "===ПРОВЕРКА БАЗОВЫХ КОМПОНЕНТОВ==="
 echo ""
 
-echo "Python & Dev:"
+echo "Зависимости сценария:"
 check_pkg "python3"
-check_pkg "pip3"
 echo ""
 
 echo "Docker:"
@@ -2168,33 +2179,26 @@ check_pkg "docker"
 detect_docker_state
 echo "  Состояние: $DOCKER_STATE"
 
-echo "Веб-серверы:"
-check_service "nginx" "nginx"
-check_service "apache2" "apache"
-echo ""
-
-echo "Базы данных:"
-check_service "mysql" "mysql"
-check_service "postgresql" "postgresql"
-check_service "redis-server" "redis"
-echo ""
-
-echo "Инструменты:"
+echo "Инструменты администрирования:"
+check_pkg "mc"
+check_pkg "tmux"
+check_pkg "nano"
+check_pkg "htop"
+check_pkg "ncdu"
+check_pkg "lsof"
+check_pkg "jq"
+check_pkg "rg" "ripgrep"
+check_pkg "dig" "dnsutils"
+check_pkg "nc" "netcat-openbsd"
+check_pkg "rsync"
 check_pkg "git"
 check_pkg "curl"
 check_pkg "wget"
-check_pkg "node" "nodejs"
-check_pkg "npm"
-check_pkg "nano"
-check_pkg "vim"
-check_pkg "htop"
-check_pkg "mc"
 echo ""
 
 echo "Безопасность:"
 check_service "ufw" "ufw"
 check_service "fail2ban" "fail2ban"
-check_pkg "certbot"
 echo ""
 
 echo "Система:"
