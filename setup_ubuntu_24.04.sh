@@ -1369,26 +1369,9 @@ if [ "$SSH_ACCESS_MODE" = transition ]; then
         { error "Временная конфигурация SSH не прошла повторную проверку"; exit 1; }
 fi
 
-# Ручная проверка проводится до закрытия 22/root. На повторном запуске уже
-# защищённого сервера она нужна только при изменении ключей или конфига.
-if [ "$SSH_ACCESS_MODE" = transition ] ||
-   [ "$SSH_CHANGED" = true ] ||
-   [ "$SSH_CONFIG_CHANGED" = true ]; then
-    warn "В НОВОМ окне выполните: ssh -4 -p $SSH_PORT $NEW_USER@$SERVER_IP"
-    warn "Проверьте также sudo -n true; текущую сессию не закрывайте."
-    answer=''
-    if [ -r /dev/tty ]; then
-        IFS= read -r -p 'Вход по новому ключу и sudo работают? (y/N): ' answer </dev/tty || answer=''
-    fi
-    case "$answer" in y|Y|yes) ;; *)
-        error "Контрольный вход не подтверждён. Остальные блоки остановлены."
-        exit 1 ;;
-    esac
-fi
-
 # Теперь оставляем только новый порт и ровно опубликованный набор ключей.
-# Если набор ключей изменился, подтверждаем повторный вход уже после удаления
-# старых ключей, пока текущая сессия ещё доступна для отката.
+# Единственная ручная проверка будет после финальной политики. Текущая сессия
+# остаётся открытой до ответа и даёт rollback-канал, если новый ключ не войдёт.
 if ! cmp -s "$SSH_WORK/final-managed" "$SSH_MANAGED_CONFIG"; then
     SSH_CONFIG_TOUCHED=true
     install -m 600 "$SSH_WORK/final-managed" "$SSH_MANAGED_CONFIG" || exit 1
@@ -1426,13 +1409,15 @@ ssh_candidate_valid "$SSHD_CONFIG" final ||
 if [ "$SSH_ACCESS_MODE" = transition ] ||
    [ "$SSH_CHANGED" = true ] ||
    [ "$SSH_CONFIG_CHANGED" = true ]; then
-    warn "Откройте ЕЩЁ ОДНУ сессию после финальной политики и точного набора ключей."
+    warn "Финальная настройка SSH проведена: порт 22, root и вход по паролю отключены."
+    warn "Для проверки откройте новую сессию: $NEW_USER, порт $SSH_PORT, авторизация по ключу."
+    warn "Проверьте также sudo -n true; текущую сессию не закрывайте."
     answer=''
     if [ -r /dev/tty ]; then
-        IFS= read -r -p 'Повторный вход и sudo работают? (y/N): ' answer </dev/tty || answer=''
+        IFS= read -r -p 'Вход по новому ключу и sudo работают? (y/N): ' answer </dev/tty || answer=''
     fi
     case "$answer" in y|Y|yes) ;; *)
-        error "Повторный вход не подтверждён. Выполняется откат."
+        error "Контрольный вход не подтверждён. Выполняется откат."
         exit 1 ;;
     esac
 fi
