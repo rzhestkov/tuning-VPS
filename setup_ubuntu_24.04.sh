@@ -373,6 +373,14 @@ fi
 # защищённом сервере не должен сначала что-то изменить, а потом требовать порт 22.
 SSHD_CONFIG=/etc/ssh/sshd_config
 SSH_MANAGED_CONFIG=/etc/ssh/tuning-vps.conf
+SSH_ED25519_HOST_KEY=/etc/ssh/ssh_host_ed25519_key
+# These algorithms are available in the OpenSSH version shipped with Ubuntu
+# 24.04.  Keeping the lists explicit avoids silently re-enabling weaker or
+# NIST-curve alternatives through a provider's default configuration.
+SSH_HOST_KEY_ALGORITHMS=ssh-ed25519
+SSH_KEX_ALGORITHMS=sntrup761x25519-sha512@openssh.com,curve25519-sha256
+SSH_CIPHERS=aes256-gcm@openssh.com,aes128-gcm@openssh.com
+SSH_MACS=hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com
 # Ubuntu 24.04 images may use systemd socket activation for SSH.  In that
 # mode ssh.socket owns the listening ports, while sshd_config still owns the
 # authentication policy.  Keep the project override separate from both the
@@ -489,6 +497,14 @@ detect_current_ssh_port() {
 
 if [ ! -f "$SSHD_CONFIG" ] || ! sshd -t >/dev/null 2>&1; then
     error "Исходная SSH-конфигурация отсутствует или не проходит sshd -t."
+    exit 1
+fi
+# A server restricted to ssh-ed25519 needs an existing private host key of
+# that type.  Do not replace or generate host identities automatically: a
+# missing key is an explicit recovery condition, not a configuration default.
+if ! ssh-keygen -lf "$SSH_ED25519_HOST_KEY" 2>/dev/null | grep -q '(ED25519)'; then
+    error "Не найден действительный SSH host key ED25519: $SSH_ED25519_HOST_KEY"
+    error "Восстановите ключ через консоль хостера или переустановите openssh-server."
     exit 1
 fi
 SSH_CLIENT_ADDR=$(awk 'NF >= 1 {print $1}' <<< "${SSH_CONNECTION:-${SSH_CLIENT:-}}")
@@ -924,7 +940,7 @@ report_ssh_conflict() {
     error "Конфликтующие SSH-директивы; проверьте источник ниже:"
     for file in /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf; do
         [ -f "$file" ] || continue
-        grep -HniE '^[[:space:]]*(Include|Match|Port|ListenAddress|AddressFamily|PermitRootLogin|PasswordAuthentication|KbdInteractiveAuthentication|HostbasedAuthentication|GSSAPIAuthentication|PubkeyAuthentication|PubkeyAcceptedAlgorithms|AuthorizedKeysFile|AuthorizedKeysCommand|AuthenticationMethods|AllowUsers|DenyUsers)([[:space:]]|=)' "$file" || true
+        grep -HniE '^[[:space:]]*(Include|Match|Port|ListenAddress|AddressFamily|PermitRootLogin|PasswordAuthentication|KbdInteractiveAuthentication|HostbasedAuthentication|GSSAPIAuthentication|PubkeyAuthentication|PubkeyAcceptedAlgorithms|AuthorizedKeysFile|AuthorizedKeysCommand|AuthenticationMethods|HostKeyAlgorithms|KexAlgorithms|Ciphers|MACs|AllowUsers|DenyUsers)([[:space:]]|=)' "$file" || true
     done
 }
 ssh_unsafe_match_auth() {
@@ -965,6 +981,10 @@ ssh_candidate_valid() {
             fi
         done
     else
+        [ "$(ssh_candidate_value "$config" "$NEW_USER" "$SSH_PORT" hostkeyalgorithms)" = "$SSH_HOST_KEY_ALGORITHMS" ] || return 1
+        [ "$(ssh_candidate_value "$config" "$NEW_USER" "$SSH_PORT" kexalgorithms)" = "$SSH_KEX_ALGORITHMS" ] || return 1
+        [ "$(ssh_candidate_value "$config" "$NEW_USER" "$SSH_PORT" ciphers)" = "$SSH_CIPHERS" ] || return 1
+        [ "$(ssh_candidate_value "$config" "$NEW_USER" "$SSH_PORT" macs)" = "$SSH_MACS" ] || return 1
         ! ssh_candidate_port "$config" 22 || return 1
         for addr in "$SSH_CLIENT_ADDR" 127.0.0.1 0.0.0.0; do
             for option in passwordauthentication kbdinteractiveauthentication hostbasedauthentication gssapiauthentication permitemptypasswords; do
@@ -1211,6 +1231,10 @@ HostbasedAuthentication no
 GSSAPIAuthentication no
 PubkeyAuthentication yes
 PubkeyAcceptedAlgorithms ssh-ed25519
+HostKeyAlgorithms $SSH_HOST_KEY_ALGORITHMS
+KexAlgorithms $SSH_KEX_ALGORITHMS
+Ciphers $SSH_CIPHERS
+MACs $SSH_MACS
 AuthorizedKeysFile .ssh/authorized_keys
 AuthorizedKeysCommand none
 PermitRootLogin no
@@ -2115,15 +2139,18 @@ if command -v ssh-audit &>/dev/null; then
     # ssh-audit возвращает ненулевой код при обнаружении проблем безопасности
     SSH_AUDIT_RESULT=$(ssh-audit 127.0.0.1 -p "$SSH_PORT" 2>&1) || true
     
-    # Анализируем результат на наличие критических проблем
-    if echo "$SSH_AUDIT_RESULT" | grep -qiE "(fail|critical|vulnerable)"; then
+    # ssh-audit prints informational notes about peer compatibility alongside
+    # findings.  Only its explicit [fail] records are critical; matching words
+    # such as "vulnerability" in an (nfo) line would create a false alarm.
+    SSH_AUDIT_FAILURES=$(printf '%s\n' "$SSH_AUDIT_RESULT" | grep -E -- '-- \[fail\]' || true)
+    if [ -n "$SSH_AUDIT_FAILURES" ]; then
         warn "SSH аудит обнаружил критические проблемы"
         add_check 1 "SSH аудит (ssh-audit)"
         
         # Выводим детали проблем
         echo ""
         echo "===КРИТИЧЕСКИЕ ПРОБЛЕМЫ SSH АУДИТА==="
-        echo "$SSH_AUDIT_RESULT" | grep -iE "(fail|critical|vulnerable)" | head -20
+        printf '%s\n' "$SSH_AUDIT_FAILURES" | head -20
         echo ""
     else
         log "SSH аудит завершен (предупреждения не являются критическими)"
