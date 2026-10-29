@@ -369,7 +369,7 @@ if ! curl -s --head "$SSH_KEY_URL" | head -n 1 | grep -q "200\|301\|302"; then
     exit 1
 fi
 
-# SSH проверяется до обновления пакетов и любых правок: повторный запуск на уже
+# SSH проверяется до обновления пакетов и правок конфигурации: повторный запуск на уже
 # защищённом сервере не должен сначала что-то изменить, а потом требовать порт 22.
 SSHD_CONFIG=/etc/ssh/sshd_config
 SSH_MANAGED_CONFIG=/etc/ssh/tuning-vps.conf
@@ -387,6 +387,33 @@ SSH_MACS=hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com
 # vendor unit and any provider drop-ins.
 SSH_SOCKET_MANAGED_DIR=/etc/systemd/system/ssh.socket.d
 SSH_SOCKET_MANAGED_CONFIG="$SSH_SOCKET_MANAGED_DIR/99-tuning-vps.conf"
+# /run is temporary. ssh.service normally creates this directory through
+# RuntimeDirectory, but package updates or socket activation can leave it
+# absent while the current SSH session is still alive. Standalone sshd -t/-T
+# checks need it too; prepare it without starting or restarting any service.
+prepare_sshd_runtime_dir() {
+    local directory=/run/sshd mode
+    if [ ! -e "$directory" ] && [ ! -L "$directory" ]; then
+        if ! install -d -o root -g root -m 0755 "$directory"; then
+            error "Не удалось создать служебный каталог SSH: $directory"
+            return 1
+        fi
+    fi
+    if [ -L "$directory" ] || [ ! -d "$directory" ] ||
+       [ "$(stat -c '%u' "$directory")" != 0 ]; then
+        error "Служебный каталог SSH должен быть обычным каталогом с владельцем root: $directory"
+        return 1
+    fi
+    mode=$(stat -c '%a' "$directory") || return 1
+    if (( (8#$mode & 022) != 0 )); then
+        error "Служебный каталог SSH доступен для записи группе или всем: $directory"
+        return 1
+    fi
+}
+run_sshd_check() {
+    prepare_sshd_runtime_dir || return 1
+    command sshd "$@"
+}
 ssh_port_listening() {
     ss -4 -H -ltn 2>/dev/null | awk -v port="$1" '
         { endpoint=$4; sub(/^.*:/, "", endpoint); if (endpoint == port) found=1 }
@@ -466,11 +493,11 @@ restore_socket_activated_ssh() {
 }
 ssh_context_value() {
     local user=$1 port=$2 option=$3
-    sshd -T -C "user=$user,host=${SSH_CLIENT_ADDR:-127.0.0.1},addr=${SSH_CLIENT_ADDR:-127.0.0.1},lport=$port" 2>/dev/null |
+    run_sshd_check -T -C "user=$user,host=${SSH_CLIENT_ADDR:-127.0.0.1},addr=${SSH_CLIENT_ADDR:-127.0.0.1},lport=$port" 2>/dev/null |
         awk -v option="$option" '$1 == option { print $2; exit }'
 }
 ssh_effective_port() {
-    sshd -T 2>/dev/null | awk -v port="$1" '$1 == "port" && $2 == port { found=1 } END { exit !found }'
+    run_sshd_check -T 2>/dev/null | awk -v port="$1" '$1 == "port" && $2 == port { found=1 } END { exit !found }'
 }
 detect_current_ssh_port() {
     local port pid ppid socket_line
@@ -495,7 +522,7 @@ detect_current_ssh_port() {
     return 1
 }
 
-if [ ! -f "$SSHD_CONFIG" ] || ! sshd -t >/dev/null 2>&1; then
+if [ ! -f "$SSHD_CONFIG" ] || ! run_sshd_check -t; then
     error "Исходная SSH-конфигурация отсутствует или не проходит sshd -t."
     exit 1
 fi
@@ -905,15 +932,15 @@ fi
 # подключается первым: sshd берёт первое значение большинства директив. Port
 # добавляется к списку, поэтому итог обязательно проверяется через sshd -T.
 ssh_effective_has() {
-    sshd -T 2>/dev/null | grep -qx "$1"
+    run_sshd_check -T 2>/dev/null | grep -qx "$1"
 }
 ssh_candidate_value() {
     local config=$1 user=$2 port=$3 option=$4 addr=${5:-$SSH_CLIENT_ADDR}
-    sshd -T -f "$config" -C "user=$user,host=$addr,addr=$addr,lport=$port" 2>/dev/null |
+    run_sshd_check -T -f "$config" -C "user=$user,host=$addr,addr=$addr,lport=$port" 2>/dev/null |
         awk -v option="$option" '$1 == option {print $2; exit}'
 }
 ssh_candidate_port() {
-    sshd -T -f "$1" 2>/dev/null |
+    run_sshd_check -T -f "$1" 2>/dev/null |
         awk -v port="$2" '$1 == "port" && $2 == port {found=1} END {exit !found}'
 }
 # Port is cumulative in OpenSSH, unlike most authentication directives.  A
@@ -961,9 +988,10 @@ ssh_unsafe_match_auth() {
     done
     return 1
 }
-ssh_candidate_valid() {
+# sshd -t is checked separately so runtime/syntax errors are not reported as
+# provider policy conflicts. This function checks the effective policy only.
+ssh_candidate_policy_valid() {
     local config=$1 phase=$2 option before after addr
-    sshd -t -f "$config" || return 1
     ssh_candidate_port "$config" "$SSH_PORT" || return 1
     [ "$(ssh_candidate_value "$config" "$NEW_USER" "$SSH_PORT" addressfamily)" = inet ] || return 1
     [ "$(ssh_candidate_value "$config" "$NEW_USER" "$SSH_PORT" pubkeyauthentication)" = yes ] || return 1
@@ -1103,7 +1131,7 @@ restore_ssh_state() {
     if [ "$SSH_ROOT_TOUCHED" = true ] && [ -n "$SSH_ROOT_HASH_BEFORE" ]; then
         printf 'root:%s\n' "$SSH_ROOT_HASH_BEFORE" | chpasswd -e >/dev/null 2>&1 || failed=true
     fi
-    sshd -t >/dev/null 2>&1 || failed=true
+    run_sshd_check -t || failed=true
     if [ "$SSH_SYSTEMD_TOUCHED" = true ]; then
         if [ "$SSH_SOCKET_EXISTS" = true ]; then
             if [ "$SSH_SOCKET_WAS_ENABLED" = enabled ]; then
@@ -1260,16 +1288,25 @@ if ssh_unsafe_match_auth; then
     error "Автоматическое применение SSH-политики остановлено до изменения доступа."
     exit 1
 fi
-if ! ssh_candidate_valid "$SSH_WORK/final-main" final; then
+if ! run_sshd_check -t -f "$SSH_WORK/final-main"; then
+    error "Финальный SSH-кандидат не прошёл sshd -t; причина указана выше."
+    exit 1
+fi
+if ! ssh_candidate_policy_valid "$SSH_WORK/final-main" final; then
     error "Финальный SSH-кандидат конфликтует с настройками провайдера (Include/Match/Port)."
     report_ssh_conflict
     exit 1
 fi
-if [ "$SSH_ACCESS_MODE" = transition ] &&
-   ! ssh_candidate_valid "$SSH_WORK/temporary-main" temporary; then
-    error "Временный SSH-кандидат не сохраняет исходный вход root на порту 22."
-    report_ssh_conflict
-    exit 1
+if [ "$SSH_ACCESS_MODE" = transition ]; then
+    if ! run_sshd_check -t -f "$SSH_WORK/temporary-main"; then
+        error "Временный SSH-кандидат не прошёл sshd -t; причина указана выше."
+        exit 1
+    fi
+    if ! ssh_candidate_policy_valid "$SSH_WORK/temporary-main" temporary; then
+        error "Временный SSH-кандидат не сохраняет исходный вход root на порту 22."
+        report_ssh_conflict
+        exit 1
+    fi
 fi
 
 # Точные байты main нужны для идемпотентной проверки. Одновременно удаляется
@@ -1362,7 +1399,7 @@ if [ "$SSH_ACCESS_MODE" = transition ]; then
     SSH_CONFIG_TOUCHED=true
     install -m 600 "$SSH_WORK/temporary-managed" "$SSH_MANAGED_CONFIG" || exit 1
     render_main_with_managed_include "$SSH_WORK/original-main" "$SSH_MANAGED_CONFIG" "$SSHD_CONFIG"
-    sshd -t || exit 1
+    run_sshd_check -t || exit 1
     SSH_SYSTEMD_TOUCHED=true
     if [ "$SSH_SOCKET_EXISTS" = true ]; then
         SSH_SOCKET_CONFIG_TOUCHED=true
@@ -1389,7 +1426,7 @@ if [ "$SSH_ACCESS_MODE" = transition ]; then
     ssh_port_listening 22 && ssh_port_listening "$SSH_PORT" &&
         ! ssh_ipv6_port_listening 22 && ! ssh_ipv6_port_listening "$SSH_PORT" ||
         { error "После временного перехода SSH не слушает оба IPv4-порта без IPv6 listener."; exit 1; }
-    ssh_candidate_valid "$SSHD_CONFIG" temporary ||
+    ssh_candidate_policy_valid "$SSHD_CONFIG" temporary ||
         { error "Временная конфигурация SSH не прошла повторную проверку"; exit 1; }
 fi
 
@@ -1408,7 +1445,7 @@ if [ "$SSH_ACCESS_MODE" = transition ] || [ "$SSH_CHANGED" = true ]; then
     SSH_KEYS_TOUCHED=true
     install -m 600 -o "$NEW_USER" -g "$SSH_PRIMARY_GROUP" "$SSH_WORK/desired-keys" "$SSH_KEYS" || exit 1
 fi
-sshd -t || exit 1
+run_sshd_check -t || exit 1
 if [ "$SSH_ACCESS_MODE" = transition ] || [ "$SSH_CONFIG_CHANGED" = true ]; then
     SSH_SYSTEMD_TOUCHED=true
     if [ "$SSH_SOCKET_EXISTS" = true ]; then
@@ -1428,7 +1465,7 @@ sleep 2
 ssh_port_listening "$SSH_PORT" && ! ssh_port_listening 22 &&
     ! ssh_ipv6_port_listening "$SSH_PORT" && ! ssh_ipv6_port_listening 22 ||
     { error "Финальное состояние IPv4-only SSH listener не подтверждено"; exit 1; }
-ssh_candidate_valid "$SSHD_CONFIG" final ||
+ssh_candidate_policy_valid "$SSHD_CONFIG" final ||
     { error "Финальная конфигурация SSH не прошла проверку"; exit 1; }
 if [ "$SSH_ACCESS_MODE" = transition ] ||
    [ "$SSH_CHANGED" = true ] ||
@@ -2107,7 +2144,7 @@ fi
 if [ -z "$MOTD_FAILURE" ] && [ "$(grep -Ec '^[[:space:]]*session[[:space:]]+.*pam_motd\.so[[:space:]]+noupdate([[:space:]]|$)' "$PAM_SSHD_FILE")" -ne 1 ]; then
     MOTD_FAILURE="статический MOTD не подключен в PAM ровно один раз"
 fi
-if [ -z "$MOTD_FAILURE" ] && ! sshd -T 2>/dev/null | grep -qx 'printmotd no'; then
+if [ -z "$MOTD_FAILURE" ] && ! run_sshd_check -T 2>/dev/null | grep -qx 'printmotd no'; then
     MOTD_FAILURE="эффективная настройка SSH PrintMotd отличается от no"
 fi
 
@@ -2183,7 +2220,7 @@ done
 echo ""
 echo "Текущие настройки:"
 echo "------------------"
-SSHD_TEST=$(sshd -t 2>&1 && echo -e "${GREEN}OK${NC}" || echo -e "${RED}ERROR${NC}")
+SSHD_TEST=$(run_sshd_check -t 2>&1 && echo -e "${GREEN}OK${NC}" || echo -e "${RED}ERROR${NC}")
 echo -e "  SSH порт:        ${GREEN}$SSH_PORT${NC} (sshd -t: $SSHD_TEST)"
 SSH_STATUS=$(systemctl is-active ssh 2>/dev/null || echo "unknown")
 if [ "$SSH_STATUS" = "active" ]; then
