@@ -510,17 +510,25 @@ open_ssh_confirmation_terminal() {
 confirm_ssh_access() {
     # An inherited TMOUT must not turn the manual key check into a timed read.
     local answer='' read_status TMOUT=0
-    printf '%s' 'Вход по новому ключу и sudo работают? (y/N): ' >&"$SSH_CONFIRM_FD"
-    if IFS= read -r -u "$SSH_CONFIRM_FD" answer; then
+    # A pasted launch command can leave extra newlines in the terminal queue.
+    # Empty/invalid input must not decide the result of the manual login check.
+    while true; do
+        printf '%s' 'Вход по новому ключу и sudo работают? (y/n): ' >&"$SSH_CONFIRM_FD"
+        if IFS= read -r -u "$SSH_CONFIRM_FD" answer; then
+            :
+        else
+            read_status=$?
+            error "Не удалось прочитать ответ из терминала (код $read_status). Выполняется откат."
+            return 1
+        fi
         case "$answer" in
             y|Y|yes) return 0 ;;
-            *) error "Контрольный вход не подтверждён. Выполняется откат." ;;
+            n|N|no)
+                error "Контрольный вход не подтверждён. Выполняется откат."
+                return 1 ;;
+            *) warn "Введите y после проверки нового входа и sudo либо n для отката; ожидание продолжается." ;;
         esac
-    else
-        read_status=$?
-        error "Не удалось прочитать ответ из терминала (код $read_status). Выполняется откат."
-    fi
-    return 1
+    done
 }
 ssh_context_value() {
     local user=$1 port=$2 option=$3
