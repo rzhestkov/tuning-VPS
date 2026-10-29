@@ -739,6 +739,21 @@ log "Текущее время: $CURRENT_TIME ($CURRENT_TIMEZONE)"
 
 log "Настройка hardening системных параметров ядра..."
 
+# ifupdown may still configure IPv6 from provider-owned interfaces files.
+# Disabling IPv6 under such a configuration can make boot-time networking fail
+# after partially applying IPv4. Do not rewrite provider network settings.
+IFUPDOWN_IPV6_CONFIG=""
+if command -v ifup >/dev/null 2>&1; then
+    IFUPDOWN_IPV6_CONFIG=$(grep -HnEi '^[[:space:]]*iface[[:space:]]+[^[:space:]]+[[:space:]]+inet6([[:space:]]|$)' \
+        /etc/network/interfaces /etc/network/interfaces.d/* 2>/dev/null || true)
+fi
+if [ -n "$IFUPDOWN_IPV6_CONFIG" ]; then
+    error "IPv4-only sysctl конфликтует с IPv6-настройкой ifupdown; автоматическая настройка остановлена."
+    printf '%s\n' "$IFUPDOWN_IPV6_CONFIG"
+    error "Проверьте сетевую конфигурацию провайдера через консоль восстановления перед продолжением."
+    exit 1
+fi
+
 # Базовый скрипт владеет только этим файлом. Он не переписывает sysctl.conf
 # хостера и применяет только свои параметры, не загружая чужие sysctl.d-файлы.
 SYSCTL_CONFIG=/etc/sysctl.d/99-hardening.conf
@@ -1663,6 +1678,7 @@ cat > "$AUDIT_RULES_NEW" << 'EOF'
 -w /etc/sudoers.d/ -p wa -k tuning_vps_sudo
 -w /etc/ssh/sshd_config -p wa -k tuning_vps_ssh
 -w /etc/ssh/sshd_config.d/ -p wa -k tuning_vps_ssh
+-w /etc/ssh/tuning-vps.conf -p wa -k tuning_vps_ssh
 -w /etc/apt/apt.conf.d/ -p wa -k tuning_vps_apt
 -w /etc/systemd/system/ -p wa -k tuning_vps_systemd
 -w /etc/cron.d/ -p wa -k tuning_vps_cron
@@ -1680,7 +1696,7 @@ if [ -z "$AUDIT_FAILURE" ] && ! augenrules --load >/dev/null 2>&1; then
 fi
 if [ -z "$AUDIT_FAILURE" ] &&
    { ! systemctl is-active --quiet auditd ||
-     ! auditctl -l 2>/dev/null | grep -q 'tuning_vps_ssh'; }; then
+     ! auditctl -l 2>/dev/null | grep -Fq -- '-w /etc/ssh/tuning-vps.conf -p wa -k tuning_vps_ssh'; }; then
     AUDIT_FAILURE="auditd не активен или управляемые правила не загружены"
 fi
 
@@ -1786,6 +1802,7 @@ APT::Periodic::Unattended-Upgrade "1";
 Unattended-Upgrade::Allowed-Origins {
     "${distro_id}:${distro_codename}";
     "${distro_id}:${distro_codename}-security";
+    "${distro_id}:${distro_codename}-updates";
 };
 Unattended-Upgrade::AutoFixInterruptedDpkg "true";
 Unattended-Upgrade::MinimalSteps "true";
@@ -1820,7 +1837,8 @@ EOF
     elif [ -z "$AUTO_UPDATE_FAILURE" ] &&
          { ! grep -Fqx 'Unattended-Upgrade::Allowed-Origins:: "${distro_id}:${distro_codename}";' <<< "$APT_EFFECTIVE_CONFIG" ||
            ! grep -Fqx 'Unattended-Upgrade::Allowed-Origins:: "${distro_id}:${distro_codename}-security";' <<< "$APT_EFFECTIVE_CONFIG" ||
-           [ "$(grep -Fc 'Unattended-Upgrade::Allowed-Origins::' <<< "$APT_EFFECTIVE_CONFIG")" -ne 2 ] ||
+           ! grep -Fqx 'Unattended-Upgrade::Allowed-Origins:: "${distro_id}:${distro_codename}-updates";' <<< "$APT_EFFECTIVE_CONFIG" ||
+           [ "$(grep -Fc 'Unattended-Upgrade::Allowed-Origins::' <<< "$APT_EFFECTIVE_CONFIG")" -ne 3 ] ||
            grep -Fq 'Unattended-Upgrade::Origins-Pattern::' <<< "$APT_EFFECTIVE_CONFIG"; }; then
         AUTO_UPDATE_FAILURE="итоговая политика unattended-upgrades не ограничена обычными и security-обновлениями Ubuntu"
     elif [ -z "$AUTO_UPDATE_FAILURE" ] &&
