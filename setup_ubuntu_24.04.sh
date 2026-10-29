@@ -471,25 +471,56 @@ stop_socket_activated_ssh_listener() {
         return 1
     }
 }
-# Apply a prepared ssh.socket drop-in and then restart the socket before sshd.
-# Restarting sshd is intentional: an already running daemon retains copies of
-# old activation descriptors, so a reload alone could leave the old port open.
+# Stop the socket and service before starting either one. Restarting the socket
+# can auto-start ssh.service; a subsequent service restart kills its ExecStartPre.
+# Even one multi-unit restart is not atomic in Ubuntu 24.04's systemd. Starting
+# an already activating service is idempotent and does not interrupt it.
+# A reload alone is insufficient: sshd retains old activation descriptors.
+restart_socket_activated_ssh() {
+    systemctl daemon-reload || return 1
+    systemctl stop ssh.socket ssh.service || return 1
+    systemctl reset-failed ssh.service ssh.socket || return 1
+    systemctl start ssh.socket ssh.service
+}
 apply_socket_activated_ssh() {
     local config=$1
     install -d -m 755 "$SSH_SOCKET_MANAGED_DIR" || return 1
     install -m 644 "$config" "$SSH_SOCKET_MANAGED_CONFIG" || return 1
-    systemctl daemon-reload || return 1
-    systemctl reset-failed ssh.socket >/dev/null 2>&1 || return 1
     systemctl enable ssh.socket >/dev/null 2>&1 || return 1
-    systemctl restart ssh.socket || return 1
-    systemctl restart ssh.service || return 1
+    restart_socket_activated_ssh
 }
 restore_socket_activated_ssh() {
     ssh_socket_unit_exists || return 1
-    systemctl daemon-reload || return 1
-    systemctl reset-failed ssh.socket >/dev/null 2>&1 || return 1
-    systemctl restart ssh.socket || return 1
-    systemctl restart ssh.service
+    restart_socket_activated_ssh
+}
+
+# Check the controlling terminal before changing SSH/UFW. A separate descriptor
+# keeps confirmation independent of the script's standard input.
+open_ssh_confirmation_terminal() {
+    if ! { exec {SSH_CONFIRM_FD}<>/dev/tty; } 2>/dev/null; then
+        error "Нет доступного терминала для контрольного входа. SSH/UFW не изменены."
+        return 1
+    fi
+    if [ ! -t "$SSH_CONFIRM_FD" ]; then
+        exec {SSH_CONFIRM_FD}>&-
+        error "Контрольный вход требует интерактивного терминала. SSH/UFW не изменены."
+        return 1
+    fi
+}
+confirm_ssh_access() {
+    # An inherited TMOUT must not turn the manual key check into a timed read.
+    local answer='' read_status TMOUT=0
+    printf '%s' 'Вход по новому ключу и sudo работают? (y/N): ' >&"$SSH_CONFIRM_FD"
+    if IFS= read -r -u "$SSH_CONFIRM_FD" answer; then
+        case "$answer" in
+            y|Y|yes) return 0 ;;
+            *) error "Контрольный вход не подтверждён. Выполняется откат." ;;
+        esac
+    else
+        read_status=$?
+        error "Не удалось прочитать ответ из терминала (код $read_status). Выполняется откат."
+    fi
+    return 1
 }
 ssh_context_value() {
     local user=$1 port=$2 option=$3
@@ -1158,6 +1189,8 @@ restore_ssh_state() {
     ssh_port_listening "$SSH_ORIGINAL_PORT" || failed=true
     if [ "$failed" = true ]; then
         error "Автоматический откат не подтверждён; копии сохранены в $SSH_WORK"
+        systemctl status ssh.service ssh.socket --no-pager -l 2>&1 || true
+        journalctl -b -u ssh.service -u ssh.socket -n 30 --no-pager 2>&1 || true
         return 1
     fi
     log "Исходный SSH-порт $SSH_ORIGINAL_PORT снова слушается."
@@ -1325,6 +1358,12 @@ if [ "$SSH_SOCKET_EXISTS" = true ] &&
     # rerun could leave a provider's port 22 listener enabled after reboot.
     SSH_CONFIG_CHANGED=true
 fi
+SSH_CONFIRM_REQUIRED=false
+if [ "$SSH_ACCESS_MODE" = transition ] ||
+   [ "$SSH_CHANGED" = true ] || [ "$SSH_CONFIG_CHANGED" = true ]; then
+    SSH_CONFIRM_REQUIRED=true
+    open_ssh_confirmation_terminal || exit 1
+fi
 if [ "$SSH_ACCESS_MODE" = transition ]; then
     warn "Оставьте текущую административную сессию открытой до окончания контрольного входа."
 fi
@@ -1467,20 +1506,12 @@ ssh_port_listening "$SSH_PORT" && ! ssh_port_listening 22 &&
     { error "Финальное состояние IPv4-only SSH listener не подтверждено"; exit 1; }
 ssh_candidate_policy_valid "$SSHD_CONFIG" final ||
     { error "Финальная конфигурация SSH не прошла проверку"; exit 1; }
-if [ "$SSH_ACCESS_MODE" = transition ] ||
-   [ "$SSH_CHANGED" = true ] ||
-   [ "$SSH_CONFIG_CHANGED" = true ]; then
+if [ "$SSH_CONFIRM_REQUIRED" = true ]; then
     warn "Финальная настройка SSH проведена: порт 22, root и вход по паролю отключены."
     warn "Для проверки откройте новую сессию: $NEW_USER, порт $SSH_PORT, авторизация по ключу."
     warn "Проверьте также sudo -n true; текущую сессию не закрывайте."
-    answer=''
-    if [ -r /dev/tty ]; then
-        IFS= read -r -p 'Вход по новому ключу и sudo работают? (y/N): ' answer </dev/tty || answer=''
-    fi
-    case "$answer" in y|Y|yes) ;; *)
-        error "Контрольный вход не подтверждён. Выполняется откат."
-        exit 1 ;;
-    esac
+    confirm_ssh_access || exit 1
+    exec {SSH_CONFIRM_FD}>&-
 fi
 
 # Блокировка пароля root выполняется последней. Удаляем только временное
