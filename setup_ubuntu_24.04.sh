@@ -510,8 +510,6 @@ open_ssh_confirmation_terminal() {
 confirm_ssh_access() {
     # An inherited TMOUT must not turn the manual key check into a timed read.
     local answer='' read_status TMOUT=0
-    # A pasted launch command can leave extra newlines in the terminal queue.
-    # Empty/invalid input must not decide the result of the manual login check.
     while true; do
         printf '%s' 'Вход по новому ключу и sudo работают? (y/n): ' >&"$SSH_CONFIRM_FD"
         if IFS= read -r -u "$SSH_CONFIRM_FD" answer; then
@@ -521,12 +519,15 @@ confirm_ssh_access() {
             error "Не удалось прочитать ответ из терминала (код $read_status). Выполняется откат."
             return 1
         fi
+        # Show the exact response without interpreting terminal escape codes.
+        # C locale makes non-ASCII/control bytes visible in the %q diagnostic.
+        LC_ALL=C printf 'Получено: %q\n' "$answer"
         case "$answer" in
-            y|Y|yes) return 0 ;;
-            n|N|no)
+            y) return 0 ;;
+            n)
                 error "Контрольный вход не подтверждён. Выполняется откат."
                 return 1 ;;
-            *) warn "Введите y после проверки нового входа и sudo либо n для отката; ожидание продолжается." ;;
+            *) warn "Ожидается ввод только y или n" ;;
         esac
     done
 }
