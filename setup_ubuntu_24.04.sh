@@ -739,19 +739,108 @@ log "Текущее время: $CURRENT_TIME ($CURRENT_TIMEZONE)"
 
 log "Настройка hardening системных параметров ядра..."
 
-# ifupdown may still configure IPv6 from provider-owned interfaces files.
-# Disabling IPv6 under such a configuration can make boot-time networking fail
-# after partially applying IPv4. Do not rewrite provider network settings.
+# Prepare a conservative IPv4-only migration of a simple ifupdown main file.
+# A complex provider layout remains a manual recovery case. Never restart the
+# interface here: the current SSH session is the recovery channel.
 IFUPDOWN_IPV6_CONFIG=""
 if command -v ifup >/dev/null 2>&1; then
     IFUPDOWN_IPV6_CONFIG=$(grep -HnEi '^[[:space:]]*iface[[:space:]]+[^[:space:]]+[[:space:]]+inet6([[:space:]]|$)' \
         /etc/network/interfaces /etc/network/interfaces.d/* 2>/dev/null || true)
 fi
 if [ -n "$IFUPDOWN_IPV6_CONFIG" ]; then
-    error "IPv4-only sysctl конфликтует с IPv6-настройкой ifupdown; автоматическая настройка остановлена."
-    printf '%s\n' "$IFUPDOWN_IPV6_CONFIG"
-    error "Проверьте сетевую конфигурацию провайдера через консоль восстановления перед продолжением."
-    exit 1
+    if ! python3 - /etc/network/interfaces <<'PY'
+import ipaddress
+import os
+from pathlib import Path
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+
+path = Path(sys.argv[1])
+try:
+    if path.is_symlink() or not path.is_file():
+        raise ValueError('основной файл отсутствует или является ссылкой')
+    source = path.read_text(encoding='utf-8')
+    lines = source.splitlines(keepends=True)
+    if any(re.match(r'^\s*(source|source-directory)\s', line) for line in lines):
+        raise ValueError('обнаружены include-директивы: требуется ручной разбор')
+    dropins = Path('/etc/network/interfaces.d')
+    if dropins.is_dir() and any(dropins.iterdir()):
+        raise ValueError('обнаружены дополнительные файлы ifupdown: требуется ручной разбор')
+    ipv4 = {m.group(1) for line in lines if (m := re.match(r'^\s*iface\s+(\S+)\s+inet\s+', line, re.I))}
+    output = []
+    in_ipv6 = False
+    for line in lines:
+        match = re.match(r'^\s*iface\s+(\S+)\s+inet6\s+(\S+)\s*(?:#.*)?$', line, re.I)
+        if match:
+            if match.group(1) not in ipv4 or match.group(2).lower() not in ('static', 'dhcp', 'auto', 'manual'):
+                raise ValueError('IPv6-интерфейс не имеет простой IPv4-секции')
+            in_ipv6 = True
+            continue
+        if in_ipv6:
+            if not line.strip() or line.lstrip().startswith('#'):
+                output.append(line)
+                continue
+            if line[0].isspace():
+                if not re.match(r'^\s*(address|netmask|gateway|dns-nameservers)\s+[^#]+\s*(?:#.*)?$', line, re.I):
+                    raise ValueError('нестандартная опция IPv6 или hook: требуется ручной разбор')
+                continue
+            in_ipv6 = False
+        dns = re.match(r'^(\s*dns-nameservers\s+)([^#\n]*)(.*)$', line, re.I)
+        if dns:
+            addresses = dns.group(2).split()
+            kept = []
+            for item in addresses:
+                try:
+                    if ipaddress.ip_address(item).version == 6:
+                        continue
+                except ValueError:
+                    raise ValueError('нестандартный DNS в ifupdown: требуется ручной разбор')
+                kept.append(item)
+            if not kept:
+                raise ValueError('после удаления IPv6 DNS не останется IPv4 DNS')
+            if kept != addresses:
+                line = dns.group(1) + ' '.join(kept) + dns.group(3)
+                if not line.endswith('\n'):
+                    line += '\n'
+        output.append(line)
+    result = ''.join(output)
+    if result == source or re.search(r'^\s*iface\s+\S+\s+inet6\s+', result, re.I | re.M):
+        raise ValueError('не удалось однозначно подготовить IPv4-only конфигурацию')
+    query = ['ifquery', '--no-mappings', '--no-scripts', '--interfaces']
+    before = subprocess.run(query + [str(path), '--list'], capture_output=True, check=True).stdout
+    backup_parent = Path('/var/backups/tuning-vps')
+    backup_parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    backup_dir = Path(tempfile.mkdtemp(prefix='ifupdown-', dir=backup_parent))
+    backup = backup_dir / 'interfaces'
+    shutil.copy2(path, backup)
+    metadata = path.stat()
+    fd, temporary = tempfile.mkstemp(prefix='.tuning-vps-interfaces-', dir=path.parent)
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8', newline='') as target:
+            target.write(result)
+        os.chown(temporary, metadata.st_uid, metadata.st_gid)
+        os.chmod(temporary, stat.S_IMODE(metadata.st_mode))
+        after = subprocess.run(query + [temporary, '--list'], capture_output=True, check=True).stdout
+        if before != after:
+            raise ValueError('список интерфейсов изменился после подготовки')
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+    print(f'IPv4-only ifupdown подготовлен; исходный файл сохранён: {backup}')
+except (OSError, UnicodeError, ValueError, subprocess.CalledProcessError) as exc:
+    print(f'Не удалось безопасно подготовить ifupdown: {exc}', file=sys.stderr)
+    sys.exit(1)
+PY
+    then
+        error "IPv4-only конфигурация ifupdown требует ручного разбора до применения sysctl."
+        printf '%s\n' "$IFUPDOWN_IPV6_CONFIG"
+        exit 1
+    fi
 fi
 
 # Базовый скрипт владеет только этим файлом. Он не переписывает sysctl.conf
