@@ -91,14 +91,93 @@ report_docker_network_exposure() {
         return 0
     fi
     published=$(docker ps --format '{{.Names}} {{.Ports}}' |
-        awk '/0\.0\.0\.0:|\[::\]:|:::/ { print }')
+        awk '{ line=$0; gsub(/127\.0\.0\.1:[0-9]+->[0-9]+\/(tcp|udp)/, "", line);
+               if (line ~ /:[0-9]+->[0-9]+\/(tcp|udp)/) print }')
     count=$(awk 'NF { count++ } END { print count + 0 }' <<< "$published")
     if [ "$count" -gt 0 ]; then
         warn "Docker публикует порты наружу; UFW может не ограничивать эти подключения:"
         printf '%s\n' "$published"
-        add_result "WARN" "Docker network" "$count контейнер(ов) публикуют порты; проверьте bind и DOCKER-USER"
+        add_result "WARN" "Docker network" "$count контейнер(ов) имеют потенциально внешние публикации; проверьте адреса и firewall"
     else
         add_result "OK" "Docker network" "внешние опубликованные порты контейнеров не обнаружены"
+    fi
+}
+
+# Для новых bridge-сетей Docker публикует порты без явного host IP только на
+# loopback. Это снижает риск случайной публикации БД через ports: 5432:5432.
+# Явный 0.0.0.0 и уже созданные сети эта настройка не ограничивает.
+DOCKER_BIND_CHANGED=false
+DOCKER_BIND_CONFLICT=""
+configure_docker_default_bind() {
+    local config output status
+    config=/etc/docker/daemon.json
+    DOCKER_BIND_CHANGED=false
+    DOCKER_BIND_CONFLICT=""
+    install -d -m 0755 /etc/docker || return 1
+    output=$(python3 - "$config" <<'PY'
+import json
+import os
+import sys
+import tempfile
+
+path = sys.argv[1]
+if os.path.exists(path):
+    try:
+        with open(path, encoding="utf-8") as source:
+            config = json.load(source)
+    except (OSError, ValueError) as error:
+        raise SystemExit(f"cannot read valid JSON from daemon.json: {error}")
+    if not isinstance(config, dict):
+        raise SystemExit("daemon.json must contain a JSON object")
+else:
+    config = {}
+
+bridge_option = "com.docker.network.bridge.host_binding_ipv4"
+opts = config.get("default-network-opts", {})
+if not isinstance(opts, dict):
+    raise SystemExit("default-network-opts is not a JSON object")
+bridge = opts.get("bridge", {})
+if not isinstance(bridge, dict):
+    raise SystemExit("default-network-opts.bridge is not a JSON object")
+for label, value in (("ip", config.get("ip")), (bridge_option, bridge.get(bridge_option))):
+    if value not in (None, "127.0.0.1"):
+        raise SystemExit(f"existing {label} differs from 127.0.0.1")
+
+changed = config.get("ip") != "127.0.0.1" or bridge.get(bridge_option) != "127.0.0.1"
+if changed:
+    config["ip"] = "127.0.0.1"
+    config["default-network-opts"] = {**opts, "bridge": {**bridge, bridge_option: "127.0.0.1"}}
+    fd, temporary = tempfile.mkstemp(prefix=".tuning-vps-daemon.", dir=os.path.dirname(path), text=True)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as destination:
+            json.dump(config, destination, indent=2, sort_keys=True)
+            destination.write("\n")
+        os.chmod(temporary, 0o644)
+        os.replace(temporary, path)
+    except BaseException:
+        os.unlink(temporary)
+        raise
+print("changed" if changed else "already-configured")
+PY
+    )
+    status=$?
+    if [ "$status" -eq 0 ]; then
+        [ "$output" = changed ] && DOCKER_BIND_CHANGED=true
+        return 0
+    fi
+    DOCKER_BIND_CONFLICT=${output:-"не удалось подготовить /etc/docker/daemon.json"}
+    return 1
+}
+
+report_docker_default_bind() {
+    if [ -n "$DOCKER_BIND_CONFLICT" ]; then
+        add_result "WARN" "Docker bind" "существующая политика не изменена: $DOCKER_BIND_CONFLICT"
+    elif [ "$DOCKER_STATE" = "installed-running" ] && [ "$DOCKER_BIND_CHANGED" = true ]; then
+        add_result "WARN" "Docker bind" "loopback подготовлен; нужен плановый restart Docker, существующие сети не изменены"
+    elif [ "$DOCKER_STATE" = "installed-running" ] && [ "$DOCKER_LOGGING_CONFIGURED_DURING_INSTALL" != true ]; then
+        add_result "WARN" "Docker bind" "loopback задан в daemon.json; активная настройка и существующие сети требуют проверки"
+    else
+        add_result "OK" "Docker bind" "loopback по умолчанию для будущих bridge-сетей; явные публикации требуют проверки"
     fi
 }
 
@@ -2532,6 +2611,10 @@ if [ "$DOCKER_STATE" = "not-installed" ]; then
         elif [ "$DOCKER_INSTALL_OK" = true ]; then
             DOCKER_LOGGING_CONFIGURED_DURING_INSTALL=true
         fi
+        if [ "$DOCKER_INSTALL_OK" = true ] && ! configure_docker_default_bind; then
+            DOCKER_INSTALL_OK=false
+            warn "Не удалось настроить адрес публикации Docker: $DOCKER_BIND_CONFLICT"
+        fi
 
         # Группа docker даёт эквивалент root-доступа через Docker socket. Не
         # выдаём её автоматически: владелец должен явно решить, нужен ли
@@ -2559,8 +2642,10 @@ if [ "$DOCKER_STATE" = "not-installed" ]; then
             detect_docker_state
             if [ "$DOCKER_STATE" = "installed-running" ]; then
                 DOCKER_LOGGING_CHANGED=false
+                DOCKER_BIND_CHANGED=false
                 log "Docker установлен: $(docker --version)"
                 add_result "OK" "Docker" "установлен и запущен"
+                report_docker_default_bind
                 if [ "$DOCKER_USER_ACCESS" = "granted" ]; then
                     add_result "WARN" "Docker access" "$NEW_USER добавлен в группу docker; новый login получит права уровня root"
                 elif [ "$DOCKER_USER_ACCESS" = "not-granted" ]; then
@@ -2603,6 +2688,12 @@ if [ "$DOCKER_STATE" = "installed-running" ] || [ "$DOCKER_STATE" = "installed-s
         warn "Ограничение Docker-логов не изменено: $DOCKER_LOGGING_CONFLICT"
     fi
     report_docker_logging_policy
+    if [ "$DOCKER_LOGGING_CONFIGURED_DURING_INSTALL" != true ]; then
+        if ! configure_docker_default_bind; then
+            warn "Адрес публикации Docker не изменён: $DOCKER_BIND_CONFLICT"
+        fi
+        report_docker_default_bind
+    fi
 fi
 
 # UFW видит обычные процессы, но Docker может добавлять собственные firewall
